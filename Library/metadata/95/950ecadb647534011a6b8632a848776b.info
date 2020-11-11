@@ -1,0 +1,1128 @@
+i.execution_mode & 4) = 4
+	
+		FETCH schedule_cursor INTO @schedule_uid
+	END
+	
+	CLOSE schedule_cursor
+	DEALLOCATE schedule_cursor
+	
+	-- in case we haven't created the job we still need to update 
+	-- the policies with their jobID
+	UPDATE p 
+		SET p.job_id = ( SELECT TOP 1 p2.job_id 
+						FROM msdb.dbo.syspolicy_policies p2 
+						WHERE 
+							p2.schedule_uid = p.schedule_uid AND
+							p2.job_id IS NOT NULL)
+		FROM msdb.dbo.syspolicy_policies p
+		INNER JOIN inserted i ON p.policy_id = i.policy_id
+		WHERE 
+			((p.execution_mode & 4) = 4) AND
+			p.job_id IS NULL
+	
+	-- if the execution_mode has changed then we need to clear the job references
+	UPDATE p
+		SET p.job_id = NULL
+		FROM msdb.dbo.syspolicy_policies_internal p
+		INNER JOIN inserted i ON p.policy_id = i.policy_id 
+		INNER JOIN deleted d ON p.policy_id = d.policy_id
+		WHERE 
+			((i.execution_mode & 4) != 4) AND
+			((d.execution_mode & 4) = 4) AND
+			p.job_id IS NOT NULL
+	
+	-- See what jobs we need to enable.
+	-- This can happen because we might create a new policy that 
+	-- is enabled and there is already a job for it, but the existing
+	-- job is disabled
+	DECLARE jobs_to_enable CURSOR LOCAL FOR
+		SELECT DISTINCT j.job_id
+		FROM dbo.sysjobs_view j 
+		JOIN msdb.dbo.syspolicy_policies p ON p.job_id = j.job_id
+		JOIN inserted i ON p.policy_id = i.policy_id
+		WHERE 
+			((i.execution_mode & 4) = 4) AND
+			j.enabled = 0 AND
+			EXISTS ( SELECT * from msdb.dbo.syspolicy_policies p2 
+						WHERE p2.job_id = j.job_id AND p2.is_enabled = 1)
+	
+	OPEN jobs_to_enable
+	FETCH jobs_to_enable INTO @jobID
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		EXEC msdb.dbo.sp_update_job @job_id = @jobID, @enabled = 1
+		
+		FETCH jobs_to_enable INTO @jobID
+	END
+	CLOSE jobs_to_enable
+	DEALLOCATE jobs_to_enable
+
+	-- Find out what jobs have to be deleted because the policy's schedule 
+	-- has changed
+	IF (UPDATE(schedule_uid))
+	BEGIN
+		DECLARE deleted_cursor CURSOR LOCAL FOR 
+			SELECT DISTINCT d.job_id
+			FROM deleted d
+			WHERE 
+				((d.execution_mode & 4) = 4) AND
+				d.job_id NOT IN (SELECT job_id FROM msdb.dbo.syspolicy_policies p 
+								WHERE 
+								((p.execution_mode & 4) = 4))
+
+		OPEN deleted_cursor
+		FETCH deleted_cursor INTO @jobID
+		
+		WHILE (@@FETCH_STATUS=0)
+		BEGIN
+			-- delete the job(s), but do not delete the shared schedule
+			IF (@jobID IS NOT NULL)
+				EXEC msdb.dbo.sp_delete_job @job_id = @jobID, @delete_unused_schedule = 0
+
+			FETCH deleted_cursor INTO @jobID
+		END -- while (@@FETCH_STATUS=0)
+
+		CLOSE deleted_cursor
+		DEALLOCATE deleted_cursor
+	END	-- UPDATE(schedule_uid)
+
+
+	-- See what jobs we need to disable.
+	-- This can happen because we do not need to delete the job, but
+	-- all policies that reference it are disabled.
+	DECLARE jobs_to_disable CURSOR LOCAL FOR
+		SELECT DISTINCT j.job_id
+		FROM dbo.sysjobs_view j 
+		JOIN msdb.dbo.syspolicy_policies p ON p.job_id = j.job_id
+		WHERE 
+			j.enabled = 1 AND
+			NOT EXISTS ( SELECT * from msdb.dbo.syspolicy_policies p2 
+						WHERE p2.job_id = j.job_id AND p2.is_enabled = 1 AND ((p2.execution_mode & 4) = 4))
+	
+	OPEN jobs_to_disable
+	FETCH jobs_to_disable INTO @jobID
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		EXEC msdb.dbo.sp_update_job @job_id = @jobID, @enabled = 0
+		
+		FETCH jobs_to_disable INTO @jobID
+	END
+	CLOSE jobs_to_disable
+	DEALLOCATE jobs_to_disable
+
+    UPDATE msdb.dbo.syspolicy_policies_internal
+    SET modified_by = original_login(),
+        date_modified = GETDATE()
+    FROM inserted i,
+       msdb.dbo.syspolicy_policies_internal policies
+    WHERE i.policy_id = policies.policy_id
+END -- update trigger
+GO
+
+PRINT 'Creating trigger [dbo].[syspolicy_insert_policy_trigger] on [dbo].[syspolicy_policies_internal]'
+GO
+
+CREATE TRIGGER [dbo].[syspolicy_insert_policy_trigger] on [dbo].[syspolicy_policies_internal]
+FOR INSERT
+AS
+BEGIN
+    DECLARE @object_set_id int, @name sysname
+
+	SELECT TOP 1 @object_set_id = i.object_set_id, @name = i.name 
+	FROM inserted i 
+	WHERE 1 < (SELECT count(*) FROM syspolicy_policies pE-ENLIST, DEFECT, SYNC-TIME, SET-POLL')
+      RETURN(1) -- Failure
+    END
+  END
+
+  -- Check object type (in 7.0 only 'JOB' and 'SERVER' are valid)
+  IF (@object_type IS NOT NULL)
+  BEGIN
+    SELECT @object_type = UPPER(@object_type collate SQL_Latin1_General_CP1_CS_AS)
+    IF ((@object_type <> 'JOB') AND (@object_type <> 'SERVER'))
+    BEGIN
+      RAISERROR(14266, -1, -1, '@object_type', 'JOB, SERVER')
+      RETURN(1) -- Failure
+    END
+    ELSE
+      SELECT @object_type_id = CASE @object_type
+                                 WHEN 'JOB'    THEN 1
+                                 WHEN 'SERVER' THEN 2
+                                 ELSE 0
+                               END
+  END
+
+  -- If object-type is supplied then object-name must also be supplied
+  IF ((@object_type IS NOT NULL) AND (@object_name IS NULL)) OR
+     ((@object_type IS NULL)     AND (@object_name IS NOT NULL))
+  BEGIN
+    RAISERROR(14272, -1, -1)
+    RETURN(1) -- Failure
+  END
+
+  -- Check target server
+  IF (@target_server IS NOT NULL) AND NOT EXISTS (SELECT *
+                                                  FROM msdb.dbo.systargetservers
+                                                  WHERE UPPER(server_name) = @target_server)
+  BEGIN
+    RAISERROR(14262, -1, -1, '@target_server', @target_server)
+    RETURN(1) -- Failure
+  END
+
+  -- Check has-error
+  IF (@has_error IS NOT NULL) AND (@has_error <> 1)
+  BEGIN
+    RAISERROR(14266, -1, -1, '@has_error', '1, NULL')
+    RETURN(1) -- Failure
+  END
+
+  -- Check status
+  IF (@status IS NOT NULL) AND (@status <> 0) AND (@status <> 1)
+  BEGIN
+    RAISERROR(14266, -1, -1, '@status', '0, 1')
+    RETURN(1) -- Failure
+  END
+
+  -- Return the result set
+  SELECT sdl.instance_id,
+         sdl.source_server,
+        'operation_code' = CASE sdl.operation_code
+                             WHEN 1 THEN '1 (INSERT)'
+                             WHEN 2 THEN '2 (UPDATE)'
+                             WHEN 3 THEN '3 (DELETE)'
+                             WHEN 4 THEN '4 (START)'
+                             WHEN 5 THEN '5 (STOP)'
+                             WHEN 6 THEN '6 (RE-ENLIST)'
+                             WHEN 7 THEN '7 (DEFECT)'
+                             WHEN 8 THEN '8 (SYNC-TIME)'
+                             WHEN 9 THEN '9 (SET-POLL)'
+                             ELSE CONVERT(VARCHAR, sdl.operation_code) + ' ' + FORMATMESSAGE(14205)
+                           END,
+        'object_name' = ISNULL(sjv.name, CASE
+                                           WHEN (sdl.operation_code >= 1) AND (sdl.operation_code <= 5) AND (sdl.object_id = CONVERT(UNIQUEIDENTIFIER, 0x00)) THEN FORMATMESSAGE(14212) -- '(all jobs)'
+                                           WHEN (sdl.operation_code  = 3) AND (sdl.object_id <> CONVERT(UNIQUEIDENTIFIER, 0x00)) THEN sdl.deleted_object_name -- Special case handling for a deleted job
+                                           WHEN (sdl.operation_code >= 1) AND (sdl.operation_code <= 5) AND (sdl.object_id <> CONVERT(UNIQUEIDENTIFIER, 0x00)) THEN FORMATMESSAGE(14580) -- 'job' (safety belt: should never appear)
+                                           WHEN (sdl.operation_code >= 6) AND (sdl.operation_code <= 9) THEN sdl.target_server
+                                           ELSE FORMATMESSAGE(14205)
+                                         END),
+        'object_id' = ISNULL(sjv.job_id, CASE sdl.object_id
+                                           WHEN CONVERT(UNIQUEIDENTIFIER, 0x00) THEN CONVERT(UNIQUEIDENTIFIER, 0x00)
+                                           ELSE sdl.object_id
+                                         END),
+         sdl.target_server,
+         sdl.error_message,
+         sdl.date_posted,
+         sdl.date_downloaded,
+         sdl.status
+  FROM msdb.dbo.sysdownloadlist sdl LEFT OUTER JOIN
+       msdb.dbo.sysjobs_view    sjv ON (sdl.object_id = sjv.job_id)
+  WHERE ((@operation_code IS NULL) OR (operation_code = @operation_code))
+    AND ((@object_type_id IS NULL) OR (object_type = @object_type_id))
+    AND ((@job_id         IS NULL) OR (object_id = @job_id))
+    AND ((@target_server  IS NULL) OR (target_server = @target_server))
+    AND ((@has_error      IS NULL) OR (DATALENGTH(error_message) >= 1 * @has_error))
+    AND ((@status         IS NULL) OR (status = @status))
+    AND ((@date_posted    IS NULL) OR (date_posted >= @date_posted))
+  ORDER BY sdl.instance_id
+
+  RETURN(@@error) -- 0 means success
+
+END
+GO
+
+/**************************************************************/
+/* SP_ENUM_SQLAGENT_SUBSYSTEMS_INTERNAL                       */
+/**************************************************************/
+
+PRINT ''
+PRINT 'Creating procedure sp_enum_sqlagent_subsystems_internal...'
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_enum_sqlagent_subsystems_internal')
+              AND (type = 'P')))
+  DROP PROCEDURE sp_enum_sqlagent_subsystems_internal
+go
+CREATE PROCEDURE sp_enum_sqlagent_subsystems_internal
+   @syssubsytems_refresh_needed BIT = 0
+AS
+BEGIN
+  DECLARE @retval INT
+  SET NOCOUNT ON
+  -- this call will populate subsystems table if necessary
+  EXEC @retval = msdb.dbo.sp_verify_subsystems @syssubsytems_refresh_needed
+  IF @retval <> 0
+     RETURN(@retval)
+
+  -- Check if replication is installed
+  DECLARE @replication_installed INT
+  EXECUTE master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE',
+                                         N'SOFTWARE\Microsoft\MSSQLServer\Replication',
+                                         N'IsInstalled',
+                                         @replication_installed OUTPUT,
+                                         N'no_output'
+  SELECT @replication_installed = ISNULL(@replication_installed, 0)
+
+   DECLARE @subsystems TABLE
+   (
+      subsystem_id       INT         NOT NULL,
+      subsystem          NVARCHAR(40)  NOT NULL,
+      description_id     INT         NULL,
+      subsystem_dll      NVARCHAR(255)  NULL,
+      agent_exe          NVARCHAR(255)  NULL,
+      start_entry_point  NVARCHAR(30)   NULL,
+      event_entry_point  NVARCHAR(30)   NULL,
+      stop_entry_point   NVARCHAR(30)   NULL,
+      max_worker_threads INT           NULL  
+   )
+   
+   -- @syssubsytems_refresh_needed is set when SQL Agent calls this proc on agent startup
+   -- all other scenarios in SMO does not set @syssubsytems_refresh_needed
+   IF(@syssubsytems_refresh_needed = 1)
+   BEGIN
+       -- system subsystems 
+       INSERT INTO @subsystems
+       SELECT subsystem_id, 
+              subsystem,
+              description_id,
+              subsystem_dll,
+              agent_exe,
+              start_entry_point,
+              event_entry_point,
+              stop_entry_point,
+              max_worker_threads
+       FROM sys.fn_sqlagent_subsystems()
+   END
+
+   -- user subssytems
+   INSERT INTO @subsystems
+   SELECT subsystem_id, 
+            subsystem,
+            description_id,
+            subsystem_dll,
+            agent_exe,
+            start_entry_point,
+            event_entry_point,
+            stop_entry_point,
+            max_worker_threads
+    FROM syssubsystems
+            
+    IF (@replication_installed = 0)
+    BEGIN
+        SELECT  subsystem,
+            description = FORMATMESSAGE(description_id),
+            subsystem_dll,
+            agent_exe,
+            start_entry_point,
+            event_entry_point,
+            stop_entry_point,
+            max_worker_threads,
+            subsystem_id
+        FROM @subsystems
+        WHERE (subsystem NOT IN (N'Distribution', N'LogReader', N'Merge', N'Snapshot', N'QueueReader'))
+        ORDER by subsystem
+    END
+    ELSE
+    BEGIN
+        SELECT  subsystem,
+            description = FORMATMESSAGE(description_id),
+            subsystem_dll,
+            agent_exe,
+            start_entry_point,
+            event_entry_point,
+            stop_entry_point,
+            max_worker_threads,
+            subsystem_id
+        FROM @subsystems
+        ORDER by subsystem_id
+    END
+      
+  RETURN(0)      
+END
+GO
+
+/**************************************************************/
+/* SP_ENUM_SQLAGENT_SUBSYSTEMS                                */
+/**************************************************************/
+
+PRINT ''
+PRINT 'Creating procedure sp_enum_sqlagent_subsystems...'
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_enum_sqlagent_subsystems')
+              AND (type = 'P')))
+  DROP PROCEDURE sp_enum_sqlagent_subsystems
+go
+CREATE PROCEDURE sp_enum_sqlagent_subsystems
+AS
+BEGIN
+  DECLARE @retval         INT
+  EXEC @retval = msdb.dbo.sp_enum_sqlagent_subsystems_internal
+  RETURN(@retval)
+END
+go
+
+
+/**************************************************************/
+/* SP_VERIFY_SUBSYSTEM                                        */
+/**************************************************************/
+
+PRINT ''
+PRINT 'Creating procedure sp_verify_subsystem...'
+go
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_verify_subsystem')
+              AND (type = 'P')))
+  DROP PROCEDURE sp_verify_subsystem
+go
+CREATE PROCEDURE sp_verify_subsystem
+  @subsystem NVARCHAR(40)
+AS
+BEGIN
+  DECLARE @retval         INT
+  SET NOCOUNT ON
+
+  -- this call will populate subsystems table if necessary
+  EXEC @retval = msdb.dbo.sp_verify_subsystems
+  IF @retval <> 0
+     RETURN(@retval)
+
+  -- Remove any leading/trailing spaces from parameters
+  SELECT @subsystem = LTRIM(RTRIM(@subsystem))
+
+  -- Make sure Dts is translated into new subsystem's name SSIS
+  IF (@subsystem IS NOT NULL AND UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) = N'DTS')
+  BEGIN
+    SET @subsystem = N'SSIS'
+  END
+
+  IF EXISTS (SELECT * FROM syssubsystems 
+          WHERE  UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) =
+                 UPPER(subsystem collate SQL_Latin1_General_CP1_CS_AS))
+    RETURN(0) -- Success
+  ELSE
+  BEGIN
+    RAISERROR(14234, -1, -1, '@subsystem', 'sp_enum_sqlagent_subsystems')
+    RETURN(1) -- Failure
+  END
+END
+go
+
+/**************************************************************/
+/* SP_VERIFY_SCHEDULE                                         */
+/**************************************************************/
+
+PRINT ''
+PRINT 'Creating procedure sp_verify_schedule...'
+go
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_verify_schedule')
+              AND (type = 'P')))
+  DROP PROCEDURE sp_verify_schedule
+go
+CREATE PROCEDURE sp_verify_schedule
+  @schedule_id            INT,
+  @name                   sysname,
+  @enabled                TINYINT,
+  @freq_type              INT,          
+  @freq_interval          INT OUTPUT,   -- Output because we may set it to 0 if Frequency Type is one-time or auto-start
+  @freq_subday_type       INT OUTPUT,   -- As above
+  @freq_subday_interval   INT OUTPUT,   -- As above
+  @freq_relative_interval INT OUTPUT,   -- As above
+  @freq_recurrence_factor INT OUTPUT,   -- As above
+  @active_start_date      INT OUTPUT,
+  @active_start_time      INT OUTPUT,
+  @active_end_date        INT OUTPUT,
+  @active_end_time        INT OUTPUT,
+  @owner_sid              VARBINARY(85) --Must be a valid sid. Will fail if this is NULL
+AS
+BEGIN
+  DECLARE @return_code             INT
+  DECLARE @res_valid_range         NVARCHAR(100)
+  DECLARE @reason                  NVARCHAR(200)
+  DECLARE @isAdmin                 INT
+  SET NOCOUNT ON
+
+  -- Remove any leading/trailing spaces from parameters
+  SELECT @name = LTRIM(RTRIM(@name))
+
+  -- Make sure that NULL input/output parameters - if NULL - are initialized to 0
+  SELECT @freq_interval          = ISNULL(@freq_interval, 0)
+  SELECT @freq_subday_type       = ISNULL(@freq_subday_type, 0)
+  SELECT @freq_subday_interval   = ISNULL(@freq_subday_interval, 0)
+  SELECT @freq_relative_interval = ISNULL(@freq_relative_interval, 0)
+  SELECT @freq_recurrence_factor = ISNULL(@freq_recurrence_factor, 0)
+  SELECT @active_start_date      = ISNULL(@active_start_date, 0)
+  SELECT @active_start_time      = ISNULL(@active_start_time, 0)
+  SELECT @active_end_date        = ISNULL(@active_end_date, 0)
+  SELECT @active_end_time        = ISNULL(@active_end_time, 0)
+
+
+  -- Check owner 
+  IF(ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1)
+    SELECT @isAdmin = 1
+  ELSE
+    SELECT @isAdmin = 0
+
+
+  -- If a non-sa is [illegally] trying to create a schedule for another user then raise an error
+  IF ((@isAdmin <> 1) AND 
+      (ISNULL(IS_MEMBER('SQLAgentOperatorRole'),0) <> 1 AND @schedule_id IS NULL) AND
+      (@owner_sid <> SUSER_SID()))
+  BEGIN
+     RAISERROR(14366, -1, -1)
+     RETURN(1) -- Failure
+  END
+
+
+  -- Now just check that the login id is valid (ie. it exists and isn't an NT group)
+  IF (@owner_sid <> 0x010100000000000512000000) AND -- NT AUTHORITY\SYSTEM sid
+     (@owner_sid <> 0x010100000000000514000000)     -- NT AUTHORITY\NETWORK SERVICE sid
+  BEGIN
+     IF (@owner_sid IS NULL) OR (EXISTS (SELECT *
+                                      FROM master.dbo.syslogins
+                                      WHERE (sid = @owner_sid)
+                                      AND (isntgroup <> 0)))
+     BEGIN
+       -- NOTE: In the following message we quote @owner_login_name instead of @owner_sid
+       --       since this is the parameter the user passed to the calling SP (ie. either
+       --       sp_add_schedule, sp_add_job and sp_update_job)
+       SELECT @res_valid_range = FORMATMESSAGE(14203)
+       RAISERROR(14234, -1, -1, '@owner_login_name', @res_valid_range)
+       RETURN(1) -- Failure
+     END
+  END
+  
+  -- Verify name (we disallow schedules called 'ALL' since this has special meaning in sp_delete_jobschedules)
+  IF (UPPER(@name collate SQL_Latin1_General_CP1_CS_AS) = N'ALL')
+  BEGIN
+    RAISERROR(14200, -1, -1, '@name')
+    RETURN(1) -- Failure
+  END
+
+  -- Verify enabled state
+  IF (@enabled <> 0) AND (@enabled <> 1)
+  BEGIN
+    RAISERROR(14266, -1, -1, '@enabled', '0, 1')
+    RETURN(1) -- Failure
+  END
+
+  -- Verify frequency type
+  IF (@freq_type = 0x2) -- OnDemand is no longer supported
+  BEGIN
+    RAISERROR(14295, -1, -1)
+    RETURN(1) -- Failure
+  END
+  IF (@freq_type NOT IN (0x1, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80))
+  BEGIN
+    RAISERROR(14266, -1, -1, '@freq_type', '1, 4, 8, 16, 32, 64, 128')
+    RETURN(1) -- Failure
+  END
+
+  -- Verify frequency sub-day type
+  IF (@freq_subday_type <> 0) AND (@freq_subday_type NOT IN (0x1, 0x2, 0x4, 0x8))
+  BEGIN
+    RAISERROR(14266, -1, -1, '@freq_subday_type', '0x1, 0x2, 0x4, 0x8')
+    RETURN(1) -- Failure
+  END
+
+  -- Default active start/end date/times (if not supplied, or supplied as NULLs or 0)
+  IF (@active_start_date = 0)
+    SELECT @active_start_date = DATEPART(yy, GETDATE()) * 10000 +
+                                DATEPART(mm, GETDATE()) * 100 +
+                                DATEPART(dd, GETDATE()) -- This is an ISO format: "yyyymmdd"
+  IF (@active_end_date = 0)
+    SELECT @active_end_date = 99991231  -- December 31st 9999
+  IF (@active_start_time = 0)
+    SELECT @active_start_time = 000000  -- 12:00:00 am
+  IF (@active_end_time = 0)
+    SELECT @active_end_time = 235959    -- 11:59:59 pm
+
+  -- Verify active start/end dates
+  IF (@active_end_date = 0)
+    SELECT @active_end_date = 99991231
+
+  EXECUTE @return_code = sp_verify_job_date @active_end_date, '@active_end_date'
+  IF (@return_code <> 0)
+    RETURN(1) -- Failure
+
+  EXECUTE @return_code = sp_verify_job_date @active_start_date, '@active_start_date'
+  IF (@return_code <> 0)
+    RETURN(1) -- Failure
+
+  IF (@active_end_date < @active_start_date)
+  BEGIN
+    RAISERROR(14288, -1, -1, '@active_end_date', '@active_start_date')
+    RETURN(1) -- Failure
+  END
+
+  EXECUTE @return_code = sp_verify_job_time @active_end_time, '@active_end_time'
+  IF (@return_code <> 0)
+    RETURN(1) -- Failure
+
+  EXECUTE @return_code = sp_verify_job_time @active_start_time, '@active_start_time'
+  IF (@return_code <> 0)
+    RETURN(1) -- Failure
+
+  -- NOTE: It's valid for active_end_time to be less than active_start_time since in this
+  --       case we assume that the user wants the active time zone to span midnight.
+  --       But it's not valid for active_start_date and active_end_date to be the same for recurring sec/hour/minute schedules
+
+  IF (@active_start_time = @active_end_time and (@freq_subday_type in (0x2, 0x4, 0x8)))
+  BEGIN
+    SELECT @res_valid_range = FORMATMESSAGE(14202)
+    RAISERROR(14266, -1, -1, '@active_end_time', @res_valid_range)
+    RETURN(1) -- Failure
+  END
+
+  -- NOTE: The rest of this procedure is a SQL implementation of VerifySchedule in job.c
+
+  IF ((@freq_type = 0x1) OR  -- FREQTYPE_ONETIME
+      (@freq_type = 0x40) OR -- FREQTYPE_AUTOSTART
+      (@freq_type = 0x80))   -- FREQTYPE_ONIDLE
+  BEGIN
+    -- Set standard defaults for non-required parameters
+    SELECT @freq_interval          = 0
+    SELECT @freq_subday_type       = 0
+    SELECT @freq_subday_interval   = 0
+    SELECT @freq_relative_interval = 0
+    SELECT @freq_recurrence_factor = 0
+
+    -- Check that a one-time schedule isn't already in the past
+    -- Bug 442883: let the creation of the one-time schedule succeed but leave a disabled schedule
+    /*
+    IF (@freq_type = 0x1) -- FREQTYPE_ONETIME
+    BEGIN
+      DECLARE @current_date INT
+      DECLARE @current_time INT
+
+      -- This is an ISO format: "yyyymmdd"
+      SELECT @current_date = CONVERT(INT, CONVERT(VARCHAR, GETDATE(), 112))
+      SELECT @current_time = (DATEPART(hh, GETDATE()) * 10000) + (DATEPART(mi, GETDATE()) * 100) + DATEPART(ss, GETDATE())
+      IF (@active_start_date < @current_date) OR ((@active_start_date = @current_date) AND (@active_start_time <= @current_time))
+      BEGIN
+        SELECT @res_valid_range = '> ' + CONVERT(VARCHAR, @current_date) + ' / ' + CONVERT(VARCHAR, @current_time)
+        SELECT @reason = '@active_start_date = ' + CONVERT(VARCHAR, @active_start_date) + ' / @active_start_time = ' + CONVERT(VARCHAR, @active_start_time)
+        RAISERROR(14266, -1, -1, @reason, @res_valid_range)
+        RETURN(1) -- Failure
+      END
+    END
+    */
+
+    GOTO ExitProc
+  END
+
+  -- Safety net: If the sub-day-type is 0 (and we know that the schedule is not a one-time or
+  --             auto-start) then set it to 1 (FREQSUBTYPE_ONCE).  If the user wanted something
+  --             other than ONCE then they should have explicitly set @freq_subday_type.
+  IF (@freq_subday_type = 0)
+    SELECT @freq_subday_type = 0x1 -- FREQSUBTYPE_ONCE
+
+  IF ((@freq_subday_type <> 0x1) AND  -- FREQSUBTYPE_ONCE   (see qsched.h)
+      (@freq_subday_type <> 0x2) AND  -- FREQSUBTYPE_SECOND (see qsched.h)
+      (@freq_subday_type <> 0x4) AND  -- FREQSUBTYPE_MINUTE (see qsched.h)
+      (@freq_subday_type <> 0x8))     -- FREQSUBTYPE_HOUR   (see qsched.h)
+  BEGIN
+    SELECT @reason = FORMATMESSAGE(14266, '@freq_subday_type', '0x1, 0x2, 0x4, 0x8')
+    RAISERROR(14278, -1, -1, @reason)
+    RETURN(1) -- Failure
+  END
+
+  IF ((@freq_subday_type <> 0x1) AND (@freq_subday_interval < 1)) -- FREQSUBTYPE_ONCE and less than 1 interval
+     OR
+     ((@freq_subday_type = 0x2) AND (@freq_subday_interval < 10)) -- FREQSUBTYPE_SECOND and less than 10 seconds (see MIN_SCHEDULE_GRANULARITY in SqlAgent source code)
+  BEGIN
+    SELECT @reason = FORMATMESSAGE(14200, '@freq_subday_interval')
+    RAISERROR(14278, -1, -1, @reason)
+    RETURN(1) -- Failure
+  END
+
+  IF (@freq_type = 0x4)      -- FREQTYPE_DAILY
+  BEGIN
+    SELECT @freq_recurrence_factor = 0
+    IF (@freq_interval < 1)
+    BEGIN
+      SELECT @reason = FORMATMESSAGE(14572)
+      RAISERROR(14278, -1, -1, @reason)
+      RETURN(1) -- Failure
+    END
+  END
+
+  IF (@freq_type = 0x8)      -- FREQTYPE_WEEKLY
+  BEGIN
+    IF (@freq_interval < 1)   OR
+       (@freq_interval > 127) -- (2^7)-1 [freq_interval is a bitmap (Sun=1..Sat=64)]
+    BEGIN
+      SELECT @reason = FORMATMESSAGE(14573)
+      RAISERROR(14278, -1, -1, @reason)
+      RETURN(1) -- Failure
+    END
+
+  END
+
+  IF (@freq_type = 0x10)    -- FREQTYPE_MONTHLY
+  BEGIN
+    IF (@freq_interval < 1)  OR
+       (@freq_interval > 31)
+    BEGIN
+      SELECT @reason = FORMATMESSAGE(14574)
+      RAISERROR(14278, -1, -1, @reason)
+      RETURN(1) -- Failure
+    END
+
+  END
+
+  IF (@freq_type = 0x20)     -- FREQTYPE_MONTHLYRELATIVE
+  BEGIN
+    IF (@freq_relative_interval <> 0x01) AND  -- RELINT_1ST
+       (@freq_relative_interval <> 0x02) AND  -- RELINT_2ND
+       (@freq_relative_interval <> 0x04) AND  -- RELINT_3RD
+       (@freq_relative_interval <> 0x08) AND  -- RELINT_4TH
+       (@freq_relative_interval <> 0x10)      -- RELINT_LAST
+    BEGIN
+      SELECT @reason = FORMATMESSAGE(14575)
+      RAISERROR(14278, -1, -1, @reason)
+      RETURN(1) -- Failure
+    END
+  END
+
+  IF (@freq_type = 0x20)     -- FREQTYPE_MONTHLYRELATIVE
+  BEGIN
+    IF (@freq_interval <> 01) AND -- RELATIVE_SUN
+       (@freq_interval <> 02) AND -- RELATIVE_MON
+       (@freq_interval <> 03) AND -- RELATIVE_TUE
+       (@freq_interval <> 04) AND -- RELATIVE_WED
+       (@freq_interval <> 05) AND -- RELATIVE_THU
+       (@freq_interval <> 06) AND -- RELATIVE_FRI
+       (@freq_interval <> 07) AND -- RELATIVE_SAT
+       (@freq_interval <> 08) AND -- RELATIVE_DAY
+       (@freq_interval <> 09) AND -- RELATIVE_WEEKDAY
+       (@freq_interval <> 10)     -- RELATIVE_WEEKENDDAY
+    BEGIN
+      SELECT @reason = FORMATMESSAGE(14576)
+      RAISERROR(14278, -1, -1, @reason)
+      RETURN(1) -- Failure
+    END
+  END
+
+  IF ((@freq_type = 0x08)  OR   -- FREQTYPE_WEEKLY
+      (@freq_type = 0x10)  OR   -- FREQTYPE_MONTHLY
+      (@freq_type = 0x20)) AND  -- FREQTYPE_MONTHLYRELATIVE
+      (@freq_recurrence_factor < 1)
+  BEGIN
+    SELECT @reason = FORMATMESSAGE(14577)
+    RAISERROR(14278, -1, -1, @reason)
+    RETURN(1) -- Failure
+  END
+
+ExitProc:
+  -- If we made it this far the schedule is good
+  RETURN(0) -- Success
+
+END
+go
+
+
+
+/**************************************************************/
+/* SP_ADD_SCHEDULE                                            */
+/**************************************************************/
+PRINT ''
+PRINT 'Creating procedure sp_add_schedule...'
+go
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_add_schedule')
+              AND (type = 'P')))
+  DROP PROCEDURE sp_add_schedule
+go
+
+CREATE PROCEDURE sp_add_schedule
+(
+  @schedule_name        sysname,
+  @enabled              TINYINT         = 1,            -- Name does not have to be unique
+  @freq_type            INT             = 0,
+  @freq_interval        INT             = 0,
+  @freq_subday_type        INT             = 0,
+  @freq_subday_interval    INT             = 0,
+  @freq_relative_interval  INT             = 0,
+  @freq_recurrence_factor  INT             = 0,
+  @active_start_date    INT             = NULL,         -- sp_verify_schedule assigns a default
+  @active_end_date         INT             = 99991231,     -- December 31st 9999
+  @active_start_time    INT             = 000000,       -- 12:00:00 am
+  @active_end_time         INT             = 235959,       -- 11:59:59 pm
+  @owner_login_name        sysname         = NULL,
+  @schedule_uid             UNIQUEIDENTIFIER= NULL  OUTPUT, -- Used by a TSX machine when inserting a schedule
+  @schedule_id              INT             = NULL  OUTPUT,
+  @originating_server       sysname        = NULL
+)   
+AS
+BEGIN
+  DECLARE @retval           INT
+  DECLARE @owner_sid        VARBINARY(85)
+  DECLARE @orig_server_id   INT
+
+  SET NOCOUNT ON
+
+  -- Remove any leading/trailing spaces from parameters
+  SELECT @schedule_name         = LTRIM(RTRIM(@schedule_name)),
+         @owner_login_name      = LTRIM(RTRIM(@owner_login_name)),
+         @originating_server    = UPPER(LTRIM(RTRIM(@originating_server))),
+         @schedule_id           = 0
+         
+         
+   -- If the owner isn't supplied make if the current user
+  IF(@owner_login_name IS NULL OR @owner_login_name = '')
+  BEGIN
+    --Get the current users sid
+    SELECT @owner_sid = SUSER_SID()
+  END
+  ELSE
+  BEGIN
+    -- Get the sid for @owner_login_name SID
+    --force case insensitive comparation for NT users
+    SELECT @owner_sid = dbo.SQLAGENT_SUSER_SID(@owner_login_name)
+    -- Cannot proceed if @owner_login_name doesn't exist
+    IF(@owner_sid IS NULL)
+    BEGIN
+      RAISERROR(14262, -1, -1, '@owner_login_name', @owner_login_name)
+      RETURN(1) -- Failure
+    END
+  END
+
+  -- Check schedule (frequency and owner) parameters
+  EXECUTE @retval = sp_verify_schedule NULL,   -- schedule_id does not exist for the new schedule
+                                       @name                    = @schedule_name,
+                                       @enabled                 = @enabled,
+                                       @freq_type               = @freq_type,
+                                       @freq_interval           = @freq_interval            OUTPUT,
+                                       @freq_subday_type        = @freq_subday_type         OUTPUT,
+                                       @freq_subday_interval    = @freq_subday_interval     OUTPUT,
+                                       @freq_relative_interval  = @freq_relative_interval   OUTPUT,
+                                       @freq_recurrence_factor  = @freq_recurrence_factor   OUTPUT,
+                                       @active_start_date       = @active_start_date        OUTPUT,
+                                       @active_start_time       = @active_start_time        OUTPUT,
+                                       @active_end_date         = @active_end_date          OUTPUT,
+                                       @active_end_time         = @active_end_time          OUTPUT,
+                                       @owner_sid               = @owner_sid
+  IF (@retval <> 0)
+    RETURN(1) -- Failure
+
+  -- ignore @originating_server unless SQLAgent is calling
+  if((@originating_server IS NULL) OR (@originating_server = N'') OR (PROGRAM_NAME() NOT LIKE N'SQLAgent%'))
+  BEGIN
+    --Get the local originating_server_id
+    SELECT @orig_server_id = originating_server_id 
+    FROM msdb.dbo.sysoriginatingservers_view 
+    WHERE master_server = 0
+  END
+  ELSE
+  BEGIN
+    --Get the MSX originating_server_id. If @originating_server isn't the msx server error out
+    SELECT @orig_server_id = originating_server_id 
+    FROM msdb.dbo.sysoriginatingservers_view 
+    WHERE (originating_server = @originating_server)
+
+    IF (@orig_server_id IS NULL)
+    BEGIN
+      RAISERROR(14370, -1, -1)
+      RETURN(1) -- Failure
+    END
+  END
+  
+  IF (@schedule_uid IS NULL)
+  BEGIN
+    -- Assign the GUID
+    SELECT @schedule_uid = NEWID()
+  END
+  ELSE IF (@schedule_uid <> CONVERT(UNIQUEIDENTIFIER, 0x00))
+  BEGIN
+    --Try and find the schedule if a @schedule_uid is provided. 
+    --A TSX server uses the @schedule_uid to identify a schedule downloaded from the MSX
+   SELECT @schedule_id = schedule_id
+    FROM msdb.dbo.sysschedules
+    WHERE schedule_uid = @schedule_uid
+
+   IF((@schedule_id IS NOT NULL) AND (@schedule_id <> 0))
+   BEGIN
+      --If found update the fields
+      UPDATE msdb.dbo.sysschedules
+        SET name              = ISNULL(@schedule_name, name),
+            enabled              = ISNULL(@enabled, enabled),
+         freq_type            = ISNULL(@freq_type, freq_type),
+         freq_interval        = ISNULL(@freq_interval, freq_interval),
+         freq_subday_type     = ISNULL(@freq_subday_type, freq_subday_type),
+         freq_subday_interval = ISNULL(@freq_subday_interval, freq_subday_interval),
+         freq_relative_interval  = ISNULL(@freq_relative_interval, freq_relative_interval),
+         freq_recurrence_factor  = ISNULL(@freq_recurrence_factor, freq_recurrence_factor),
+         active_start_date    = ISNULL(@active_start_date, active_start_date),
+         active_end_date         = ISNULL(@active_end_date, active_end_date),
+         active_start_time    = ISNULL(@active_start_time, active_start_time),
+         active_end_time         = ISNULL(@active_end_time, active_end_time)
+      WHERE schedule_uid = @schedule_uid
+
+      RETURN(@@ERROR)
+   END
+  END
+  
+  --MSX not found so add a record to sysschedules
+  INSERT INTO msdb.dbo.sysschedules
+         (schedule_uid,
+          originating_server_id,
+          name,
+          owner_sid,
+          enabled,
+          freq_type,
+          freq_interval,
+          freq_subday_type,
+          freq_subday_interval,
+          freq_relative_interval,
+          freq_recurrence_factor,
+          active_start_date,
+          active_end_date,
+          active_start_time,
+          active_end_time)
+  select @schedule_uid,
+         @orig_server_id, 
+         @schedule_name,
+         @owner_sid,
+         @enabled,
+         @freq_type,
+         @freq_interval,
+         @freq_subday_type,
+         @freq_subday_interval,
+         @freq_relative_interval,
+         @freq_recurrence_factor,
+         @active_start_date,
+         @active_end_date,
+         @active_start_time,
+         @active_end_time
+          
+  SELECT @retval = @@ERROR,
+         @schedule_id = @@IDENTITY
+
+  RETURN(@retval) -- 0 means success
+END
+GO
+
+
+/**************************************************************/
+/* SP_ATTACH_SCHEDULE                                         */
+/**************************************************************/
+PRINT ''
+PRINT 'Creating procedure sp_attach_schedule ...'
+go
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_attach_schedule')
+              AND (type = 'P')))
+  DROP PROCEDURE sp_attach_schedule
+go
+
+CREATE PROCEDURE sp_attach_schedule
+(
+  @job_id               UNIQUEIDENTIFIER    = NULL,     -- Must provide either this or job_name
+  @job_name             sysname             = NULL,     -- Must provide either this or job_id
+  @schedule_id          INT                 = NULL,     -- Must provide either this or schedule_name
+  @schedule_name        sysname             = NULL,     -- Must provide either this or schedule_id
+  @automatic_post       BIT                 = 1         -- If 1 will post notifications to all tsx servers to that run this job
+)   
+AS
+BEGIN
+  DECLARE @retval           INT
+  DECLARE @sched_owner_sid  VARBINARY(85)
+  DECLARE @job_owner_sid    VARBINARY(85)
+
+  
+  SET NOCOUNT ON
+
+  -- Check that we can uniquely identify the job
+  EXECUTE @retval = msdb.dbo.sp_verify_job_identifiers '@job_name',
+                                                       '@job_id',
+                                                        @job_name                   OUTPUT,
+                                                        @job_id                     OUTPUT,
+                                                        @owner_sid = @job_owner_sid OUTPUT
+    IF (@retval <> 0)
+        RETURN(1) -- Failure
+
+  -- Check authority (only SQLServerAgent can add a schedule to a non-local job)
+  EXECUTE @retval = sp_verify_jobproc_caller @job_id = @job_id, @program_name = N'SQLAgent%'
+  IF (@retval <> 0)
+    RETURN(@retval)
+        
+  -- Check that we can uniquely identify the schedule
+  EXECUTE @retval = msdb.dbo.sp_verify_schedule_identifiers @name_of_name_parameter = '@schedule_name',
+                                                            @name_of_id_parameter   = '@schedule_id',
+                                                            @schedule_name          = @schedule_name    OUTPUT,
+                                                            @schedule_id            = @schedule_id      OUTPUT,
+                                                            @owner_sid              = @sched_owner_sid  OUTPUT,
+                                                            @orig_server_id         = NULL
+  IF (@retval <> 0)
+      RETURN(1) -- Failure     
+
+  --Schedules can only be attached to a job if the caller owns the job
+  --or the caller is a sysadmin
+  IF ((@job_owner_sid <> SUSER_SID()) AND
+      (ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) <> 1))
+  BEGIN
+     RAISERROR(14377, -1, -1)
+     RETURN(1) -- Failure
+  END
+
+  -- If the record doesn't already exist create it
+  IF( NOT EXISTS(SELECT *  
+                 FROM msdb.dbo.­L°äLTçÃxvt%íùGõôÊ!BS|f!ø±
+À#>_fÿqÍSJ0üÊß‹ùÑÒäKtß¸€Fë±ı„yJèÈ’ÀN×ÁÀÂtA-ã·œí·ÚÎïeÄtI Ê'!n€fZ…]/6•±i…Û&o/èÏÚ4õ>qX¿2÷ò»¶ü{®8—îVw	3ØæI›KÁOw¾X>Ìë¬JÜ½ÖâÑw|oÃdYŠ¤¦çTígÎıl9H*?\'\ó'ïMÿğ(™~(ó®ˆÀ¤	"ÜucVáêq_N@F³®Ëy›Dv~\¶f#¬&gªi[Z)ñªÁQ&Ñúîúú+—³Ñ;³Åüæ~ÇûÒ`¯uó@–`å–!bmó›X¸g?h‚[(øY·G˜¯òíì1³†ùóŒ¸àŸü½€&?prr«ë“õË¼ë_@LŒ 4^&ŞÃ	ˆ·eÁ%7!—À~rdnÁæ.öğúUàúYàœÖ—ı8|6xió•äô÷ª:+½l‘šõÖvv?}'²H-o}qûËÎ<ÂugÛÛŠ®…_<[N§ÀøÈ{ùÜ5§S8Î÷’ıt0# C£öĞ™„…Û™õıW·_5É|Tîù¶¶Ëµ[N9u
+üS•HÂ–ë)àoì:ş´w`r7D´©ò¥…)loDò‰z¤D {…DãQ É¼»IÂtg’^ÒŞ›»U°^Å¾Ís:ğš²¹ãFbÏ,Ğ‘~˜0¢2N,Óí(Åo¼hÌo¾ıéœı‘`Å|Åù¶E‹PïŸ/“²‘æ‹ùÒ`bûFÓ[Œ»È l»3ÅVõ}vàM]à‘ç‡nFFØ0^Ï­!ÿ‚ùd ^Ë[q1zÚDŞZúîø5Åt¡ï_ 	v‹Ãì~{Ñ3°¼³N£å8ÀÈ:×‚K^<ûıão8ºDZ$}gYZ|óèæÆp(­.“Y
+«ü Wm…ÿŞõÃ+ÆI¶“|hîÌÌ‡ãûeÕÂÛÕAºî Š(ï‡­ºß®¼}l™Üñ 1©+Ú©Uà×Òs¢(ªİ*åVˆ0"Ø@xl…€¾SÎxï›qpŞâºªºŞÃÊ	‚Må)JmˆèEJöæ¥sQ}‡kœÇK~˜ 3ÿˆ[SÊ5Ë8?^¤M‚Gš_ûÎŠùA‘ã³—Ì¹Ÿ”, @é÷œ^Ôå»¥É· OÂâ(ïãÂ|²~®òÿBÿh½OŞ‹ Ì`!<7w+—3º8h7N¼¨=MÀuÌx6%ì‡ƒâUãÎ×²¼ğÃC·.¹¦V™½ò¼÷BpÃ»æ¬»¯lÜ`t¡Ù
+Úfî.Š;Õ@´£ûBô‹OÿRğtuÍô¼VùİV^ìG­mÿ¯]ı«iIÀ2¹ËğÚm·ÌúqZÃÄôòÙ=Ç –ªw›>5RÛ)†?Ü(êZüƒl‘ß Ò‰p[Ús¿ª†Švùlj6Š÷È->´ùï:x"HÜ9`‘ß¬ÛTºNí«yıÎ‘”Ä˜—~¡yµHiüJóæ“ş~f°}Jïºsëwm¨çyß˜}1ß•æë yK¿d>uÇoâ`dÄoäP_Ì8 ¿Ñz¢g‹8,+8€HÆcíÑxt†×¸Ù E||Ÿ~w’?\4_Ê÷g»œ¡åu‹gÃ­°Íõ‚ŸÜx±ø0¹UEâ¿¨$³@ÚÄÿ…ÎVå%yï›»õÔøŒ92q9îGc¯Üny›~Ç,œI½ÑZÃ ùn>®î/«,AĞB§:¨|¹:¹ÅìäO«ãõ ƒnÒóêÈ–ÈÖ£•©?©sä!X€3ÔÜ¶€y=47Ïl.+e-¹ú$*“àõ<L»›+QóC1‹¡&U ¶Ó'¢ÃÔĞp-fg47T<Rh|¦ŒüiVà3	ÀÊôÇçÉò¥°­ç6Î—`9ªğ­Ì¾nnÌÈ¥½+ÍóIã¦h1áŒÅ2ù$H]f×™>b(°”ı€`!1x¥ ÇbŠñ#p„ıNkŞîyÎâœ¸ëù~ËTuÇTaéôãØıKı§œlV&o—o$Qú€bİ$uƒ´ÈÛGq§º^ï¥sCš¶f s?4‡“¹‹º5ÿÎA=ö&P¬HWÍòà™õg «¾{İ;ï}ùÒ³Ø„‹Õ­é~Dw6É¼väš9¦ºK¢‚i•çóÜõÈƒÓãÚ.Öõ4	\3ÏÁAàÀKèE„BÔMHòœ'!:&üµBàÛ	¡-Ö…SÓd¢KøkÇ!:ˆğĞX06¦·¶Î<„[+¥w>M >³ğ» !të§¨oWj“Ï$ylZ÷q³–ùb©ƒÍw”øsÁÖ#$€ÀÆÏƒ€è2õ™‡©Gó%Ü"¹Ü
+®Z®€øÉMây^Å!¡5ˆĞƒyL+jZ«ÈÏøu”e«^x^ØñjoÓmßÌâékÓ?L¾Ÿ¿QŞ>Ìór}É\hõ©òtİnİëa™åûÅİé˜ÔTÈˆûE	#jë†ÿ•/Üğ½zŞÿË/\‰ÿæÚÏ»ñÑ¿ß½h¢*@™Ù¹’ºo‘¹t¡·2
+?.`Y´h÷®œû
+¸/
+â!·ƒ"µ‡¾!ĞËÂmÕOÜAß_Xx„¡N>Jİ|xU´¶üRvœ$È„Çâc:PÙîMH9b;qúh·Os?T V¦ß‚>z#ú¤|ğí„ùJò(Î?|OÒü%ó•Ôñs8KÌ0” ={# ÊÜ+·SG$z©¹ØàNì~”ñ.B…Ê’KÃ,vßUUdv ReŠ"ª‡nß¹›N'ÿtöÏkgîªg4Ë´.İ yŸTŞ`’ÌÚ¯¥N{¯|šQLˆœ`ÛTiºAgÛëv}gtä?;¸f^ì_ğzôp)ñôîßQ.·š˜4Œ«–ßÎÖœyİ3~İ2Îm8à“G^×ÎuãöOœ«",ç|Ñ/§÷vœªï$Œ+è˜Ñ.éã=·[ôé,í[ñé*’7@÷¯xQ½… N'N%­¡½x`y¡Ì+¼±ÌxØğ€òŞÆl?ÕHÀ§üı¡.àï¾¸m0ı²	—pA9£ÏÉ}˜¸çe¸vÕïø0øüÖ=AóÅ|=×¼Ô
+Qô¬ÖÃpÂüº¬æ9VêW!!ša5^Ã7!@©	[XìĞso’xqtÉu’y.º\/Èâ¾¾V´œ»èŸ_{Sòÿ1Rò.'9>©——ó™‹_ôÒ½ú]*MsÏ›­å €*è¥ğy25Èb76OçƒğÕÿèeÓ~yhüiIJÙõvw“êÖá~]÷h§ş ³éÓê]m_‹¶âç‹<Ù©³)›è	üÔë­÷’p±—eViÜÙö†Nà½<'ëœhoìö;×¾…ïoxñÚ<ô{À€I6À¶"êä¼6æc†Q¦ÇP–D® :p¸bi6VíæŸè>U ¤ı˜~ 7ìÀÏã÷eú‘\4 ¢9Óm©¢çÔñÇ”š@ó |ÖçŸÑ|z0Eù‘±RŒPÈy‚˜líPFóÊ÷Ë Ôÿa<B¡ÿş\BJ§òÈá8Î _õ/÷ÚL°OÎ}–Ş‹¾Ÿ·Ò»$Ôæ5 Kb$©Än¨l”xÓ<:­ë5²
+(KİĞdÑË¯›çº—¼NÕõl&-SSµ]ÿ+á†y¶­:¾9õ¶ÿÖeã?»õ·hõ!8‰(îŒ'µw¾}ÎœóÎW«‹ÕNyTÏÌ=ÏnÅ|l²¢¨²¾Sz9¾Ÿƒi~ğæ[µÛm»^‚Ë3·*R²Ó©Ï “~ËcêìaæÇÅÎ\H[)cPFâ	YSofUÂ‚É7µBs4K;¥;4æè¡ù¤œÀqÍDi¿L?-\0S&¿O=)n?RŞI	P4¨ÛqÊài/>_šï¦±»«.†ù¿'
+É'¢%c†à D–ÑòóºmÄKW%ùc#§,@ö¾UÔ^š_â|[Ş0o›‹İ§i-©1ãq¥hX”¡	J2EL,È½VœgZ™û´Sj¤\@!.£bWºÿ’!ïf^Û¹mö™@Àj±™.Šâî<¯^?¾ivî™â_š
+ÕkÿÕ-³õ‹ëu§Œı«ÑºG”`’IyPÏ¡×Ø„½NU„3‘ZéL¨U¶ç—*”Ì#“ºæ³Lğßr…ÄD"Û^·]^Ã°í”åhZeyÏOÏÀP7­œ”¶—B® ªˆ'âÍYWHÎ°F0XóiÛ'
+€´Ÿ"Ocúá?]»š˜±Êï;òû¶æºŒ_)åÒ	! j:ªñ+1¤˜O7Ç“˜Ïà#L~eµ[!!VæğM¬“h„‹ ÆchÈÿ¹#® ¥Ê’İ0˜ãò½ù^µ{Lè˜¨=pj´+÷»AĞİŒİx3N—ã Ùğªz£Îe÷Î/²Ã0å£ Û}6š/ +s±½n¶Í†yyí)óåè™ğ—Ÿ~Ù%U½Gv¦Õ³oÿ¯ß3Õ?ò¥¶©îVnÜuëYQ•QxŸY«bû˜÷ô`>ÎÆ0¦VVŒŠ’YĞ ŸíOó¬í9]ÒT„*†âÖÇ˜¢AÅ#×íuê´]UÇí‹ù"Ù?´íb(’×!áŞ.ö	¨®*TŸ…í¨—á·x¦Ü€"Š‡cø‡ó<uØÙí]Àß}qCÙ>#Äév¬é·™¾IÁ8.ì[&#‘ØBJ­÷3D’G.Ïf÷dğ·0ŒXşŒæÃJjù ]åË•ìèéÕš|\WnOË¤š< Uü(2ê$áVoÍıRë9çéğ—¶_®ËI1 xTÌ’LX»YœINÃ`4ğrgàGÎÅö¿»õóñ×Î}¹º=Ëê£rÊü’ë€±9š…¿úÌÏùWİN#©oÇf/›–·‰Òb. VgÇ¹*÷}B¾}ÏŒo§Åíƒ©Ó
+}¯M.À+BçÛ‡ïÕëk[ÕxvLË¢šÌJ—ùç£‹“J?¹Ë‘©7Ö=ø²ÎÈ÷À€Iê:0XLÌ˜˜/0£=r‘—È­×É}c2ÏŠ:BÓñê-´†û¨BÒÉt4ME›%™ÙĞ†½[OÄO€ÿşSó‘(NOqÑÆ<™ÎÀIsü¾ÊºÂ*»ÉïÃğÂkƒ§`$ P¹›Ä!­NØ³™½¥ÏGÓO˜ß‡ éxE&ßj=HÛâ d`-„ò ˆ6Ş¼b†_¿
+æSŸÁlÔ;óEù &QUó‡T×ºU;
+Å”·“]×Í¥bVÌıKåfÕ!Éşæü{†ZlØÂbĞÇ“§„ßO‚íÙçêKşºûµg®ºO÷/8Cdêb<¬RrE?wşiïg¾úœ¿ñòV±ûúAyóö®s¾×ñŸùb½uyÍn}¡s¾zûáw(ú-*¤›±Û¤Òæ"	e€*À×ô&Óºö1«õŸTËp‚Ş†›çí`k»µH†şpĞ+%v:ñæbr8v·Ï“MÒU™áİ`JDßá‚Öd‚…ê „¤M­ Iƒ~ãâÃÕ( ï§7á Ì^jØšiªUØ ~ùh›ìi¾f'ªs¢[€pÜÉœ“ä¼ùfí** ğÙÌŸÌ¾Õ|Ğ«b{~aQ¾\Ğ¿ı,¸Ôúp¬¬¹ [álòg«”ÎE–ãú(Ë:Sw~Ûd$Ùùã¹­¸—<ã}µõ…è¥h;¼^ ‡ pYúVñ¾·l×iº ‰ßöÖòKÅÄ™ÿòîkŞW¯|©úğ;A<İÙv7`JŸ?õıÍv;ã÷oZTº¹Ş3í^ìv_è;înfº]Ïœ¿Ü+¼?w#Úa«™·6z¿¼õËÕŞƒqqìÃù9Àƒ
+¢
+
+„wJ€¡ÖA+’s~†ë¸_
+Î¹_¦»a«\öZƒùÌíbiª¢ £ÒsPøUµÈ$"$¥ˆrQ™|¬€¦¡‘[#aDÖCV`Ğ%,¼n~ówoõ ;>²cùÁ!ßŒêc P8»áoŠ¶Ôgìb¦T.¦ÛÎQ±9äËlVĞ†{Ücåµè0æò_0æÉçSÄìÃ|M¹°ìÉˆù˜vö"@Æ×Ó¨ˆBá# ‘qğBÏåb ·¹Ö£,–cs³(ÌÄ	{€è#üNå\.‘Ã±·mŞï§÷ÜÔû©ÁFüÓO]ÎßøhÇ	GëåØ’¡;ğãéºIQÆn@	¹j×·îœNÜrè(‚ÂïìT“2÷CÊŸsPØ¹~Ç?}XÒ0POvåì­cçpï \\ó
+“ú/œ¿áŒæÑóşµô¨UëN¿ìD` £QéƒMk&‚¸ù=êşÀİœeF’ºÜRó§i¤s40! «ængæ“â  ]¶¨>xÔH-×%¢„,P!ŞàÄš6%%Ø›Z©Ãˆ€§JH0”xlû˜xïï?c™LØGê™¤I$§ìyş
+Ny—0^, ä“˜©À£m™~˜
+ŠGQ‰ß©è‘Ş•“°è](kÑ¾L¹´Yf_Ù<ôş”ùVâ zYÈ_¿WM@í¶¼¥~d1 !"úó Ú¬ØK    IDATz*q²ÛV&®?¯ıÜ\è^ïÿ‚{Tÿ0Ùìµâ_ÿoÿºãVÏÛê÷ŠîÍ·gÓâVõ ÓŠ¾Şùª9uMÈLÓ/v6‰±B¿KUëÂÕCçÁtRÜœ	öÜú0CË}ßÌÒêÛ»÷êÇÎ­ÅqñÛ”·F.¼¦4,ß{ïnõıÃ»Î¹ÍíìÑ·“ßŸıöi^ÔÁaÙñ7Ü„­Ğì‘™ô€u6 ¡Ø;ç‡Ï»W»O»ñ¼(ÆîÂ„“[T˜góv¶p>¢i4Ù#öSo	äesE&+`ViâÇ±€šb{‘çüÆ×µŠ?¾É÷ÃÍX‘ÆK p—Äb¸+ÒìJ<¨j%ş»aË)s$CÌäú¼A»GQ
+?·Úl5_Œæ;1PîaåóÑ|¥ië’ÉçlÖäÛ‘À|‰œVwAàÁš€ujÕíy’¼F.jü$
+-ãşvğÅŞá¾9À%é´¾YŞ)ö¿sì_ÿµóé?ûßú^œ¿™î†OÇ_~¦µá‘WİOiå›o%{ùh¾›İ÷[w;Æ+ÿÆúeóİú¡Yó#j¾;(‚ò(Ÿª¾Ş3+.†æá;ÁOm_5Ñûw¿sËzQqŞlñËŠû{ó…?&Á<Í©LÖè‡Ş–tz£16¼ÃÍ¥9Ì*·Õõ‚îâ<÷5äfë2måf›F9UÆª3ˆî Ê(q:xÈÓ¥ÎÄ|DÒpjÏL®"uÍ;$"h
+Eqûc°d¸¿	zVû‰%{FmÜàWÍÊ°ziãz.Eä¸
+Á2ÕLèsjà¶}JKK ´äíGÃy„öûŸ˜ı3Ì‡Éøyª1ùÖ `pÿƒıÚ‰_Ü§¡ÄF5j—&*öëûN+hySàV;:gnô·êú?};İú6ê›cç¥ë´á›„µd&åZ½8Np!¹¹9>ÌÎC‡¶’ò8Kª´7÷,ªÙìÀŒaÄ¸†WÜ‹ÅÎx\„‹ò›³wÒÄ]ø7‡î[Wİµ°•şáı{á«Ïg7'Çé$ßHÍ»ôıôè›ÎŠº]¸Ù‚ºå-nŸºigRáúMä˜õ‘¢]xî¹¢¸=vïcG'¦FÑÓ×¿š~ôQØÚü^ÜöR+¯Íó“qE½ÂvY¯iæt>©Ã^æä,JQDËörˆH^€ ”ÏOp¸ ™:1”t²È_•J¥|‹°CŸ¾P--·1¿ê5A~`‡ĞL1KÕ=ü©zô“}0ßZxªô®ç-ã|}‹í>õÌÊçË:Xæ«?Zö¯}¼eêÜœC„“¡Ph€ pÔíçhy®ö“)™ã
+Ë´(Ê"õ7Lš–5®—›…9¢$óş|B$Ó3ûÕa¹ÙT MNgE§9“9­¼ìq½VÜ.­Fbİ÷â‹PqæNhåûs¬»‹§§‡ËMªƒh´ÿ6¦şÀßèÅÉ·§ïÕÁ^>/ïI;!5¦úQ‘¨ê82¡Ö0R•‹¨”¦ÃŠI«µÛk{õŸ^w@$ÙƒÂ™xƒAÀ±›~Tİs½öĞ¤6ãİ2èÉÃ¤ô6GU~ŒV‘Cà/	NÂ1RÄÔ8V¦´ ­…ÈZ0Øœ³@ğc@)š³ïwÑWi<?´ßh6@C:	çML5Ú
+üĞN¹ÇVû¥åÖôÃü•¦Ö‰å$y(æèB=Mƒ—ÒrËhi>b!æ[ô/k°üp #ÂÛğ;^Kö#Ø†„!e·iC`Z¦³Ho{u×Îçf;ê1`7xq};?LgæM’îOWL7‹?|ğ­ÒÈ[ ‹AB3ŸOöÀ]¯¨%&Ùø7Â`æ…æß‡Ş¡;Ìşåôh¬›µdİtÚÇ—o˜áÈ/ÆıÂíENq·-’èİÊÏœ[$‹¸-^äY@â2pªE€¥ÂçŸ3•S:«bŞ×Xö°ª<:Ö’VTú7<(¿—èˆÚïx–ÏÃï“¶&@¦SÊwsËxët,•³RUØ	ÄÄ
+ğİŞÁF ÙÊ53$J´V ş¿B¿Øïi7¤>³ÙÅ8\8åJ$ZOGnAkå	ùkê3š­ƒ:[€(Óf“íãŞ–<ÒN±TB –Jƒ9±}@x.ıµÌG•}1_£\ùü'1ŸÓ5BbÏªq/…ByƒERÜI€œwšx®â—"­¢4)@ »ÅI~?™›qtò§æÃj×êÀ_\úñeS´êjá™x&E:.ËªG–o-Íš?Ø96Ã©^É®˜µ¬Cúö¡ÙZl˜‹f“†ÕØY°†ŒKûoE¾ÑÔ—’a4ÎyNJ“ÿàT¤¡i›0éDÔÄ \jÄL…¬åÇ8×ªgE¤¢<XTfÂÄŠ-d:{Wû—ò6ùÔur-aÇÉ¶ún°˜8Á8§…N‰_x¡~C\µxg'áŠ—\Å®£HP¡mJ_âÙíQ€ÔğŸòËğ‡æË÷}*eê›œşÒ÷c~’D6/;DäşÃnşãÉôÑø	Ë`îã~‰äıı’‘¸p8\€?Õ|1_ZO|±ƒ\9nO!U"<"€RVf]RAHÜø~‘æÇÃøgü0¡e',ÒIz}@ñ4[,@'™Ûêô³YzÛÍ¿{n«œß‚µËæ]¯ÑÔGp÷ÿšãìĞÙ'H=4Ìn™ã|`s“&`Í«¤èaÍSåKˆ¿hN¡ËÃtÁeâU*ÜæºN¨Û„à¢ÑQË¹ĞuÊ½EU÷ÈìÔD·)'ñæôÒ9»14—Ö»ÅñÎ[eÔªëİÏ\oò 7Üvaá"ìXj¯îqZi¥xµ,Ô¤BB0X¿·;1¯\:­œÀ‡ç)æÜ	àO)`	
+æ¿NJrØö÷ƒø í×êZ OH×5Z·)ÑÄüXu\ÌWÄĞ˜u¾ÃˆqbŸÅª$îVq>Z
+4® ÑpË|†Ò ğƒ­¡Ë4¸ökĞ¤+Ê¶L#*ÍŒğ‘†Rß¥™“&ı¾7/çAàìTz¡ßÆ­QÖU8bŠÆØsÛçŠiz‹–‹zÂìšğŸ'Ù¾G—wáÄey|ŒúÃ·"¡âG~÷4O|?è(;;5!yùÉ.2JO„3ì»ÌÁîÏëˆ¥ÂhÁ×ğ›t®!OM'šÓµÕD‚~µÖòÊƒl¬ßˆ²äÖ‚ø¶&Vğm+‘Û
+ë~@"şÁû ˆÜ`¡wµ$Lå$<á‡zĞ°ò4…"šTµ ¢	[µQo¢ãnÈ¬6iİ#›˜X&æj¾>šMB 2Cè ¦Ëgk¢¦İ‡\`/Pv°£Ğ¹˜ÊVûÉx%*4‹¬é'+/Ö+Å«³Ùô.—Ry†6ş]QÓˆ‰pÀãÌ—d	ò¢šµ€	ÿô;ŒÎHÛã¨ÔSUƒÒ*¹ç†ƒ2/³›LÈùpQ/Èªµ.—Å‚î‰Œlñ¼ƒõ(ÒÙŒn`‚ìÅ>=³2àH?Ë2¿©Ó-†~V~w£•³”&ÍÀPoÈå6Ür1bfA‘Æ?ñs[ŠöXIúI.<Ôá:c&¬aLÎé:Îy#zÉ¯<İÍFLKèÊúSdvZTÂè%¤ÙÓÛ*é,G ªŠÂfnújårsºå©ÆÒˆc),A<Ë3…„"¬x©>uÿê.y‡åö¨ ˆUzHŠ¡J"·ÁI¤mh·+ëG¶ío ¶C!ñÿd{í¤~fµ)æ_¹1sh­¿•ìuJ„dşåN8N‚³ôùÜ‡šHÍğgú¨íTi~o¯ÑH6W¦*­V_§í¼Â|Lï|>¿’½ğÜˆº,CÆ®¸İ¨¯u®ºDve5&WƒSêòO¡×±à¥»ŞWØC"Ç-gm}`Ú‡ÅèXĞ.n{×®V~Œ÷î$\ZbQ0©ßı]|{WG—{Ş…‚Ô7PªÓnE+íANzlÖ[æÁ4OÌ¡¯	wn3¬u2#
+¥ëÃ¤Ótw+'ïN	Ë
+şh€rnb–²U2ùHxÏPNÅKQ¯!7@§ì¦½v;q|rÕibÍ?.ŒÜ%0€Ï2ãà«‚uE¹š˜ ÷“ƒj4s®óPJ·é^ËHışåªˆóH"„÷˜~/¯Z¸e¶µ$Kk _à:­Ù_2_B%mSØy'!—€Ùó DAø•æUU‘Ke3|1š„·ma’dôû ­,X/¯˜§¢¾òøá­I/}×ÜÍ÷ïï¯\ºâ°sîŒ÷Q·"ho^,gó‰7ZĞ»7)ÌMEbÇ]ìNéSªJrÆJ‡ñ•µrFß€[¶˜ö@KNJ¿ñ½IaºÂÏÊ.f”9ÊNÄ\Ó¢œM)ó]ğãÅ_ƒ¾£C³&Ú^™ßIÍCÌ[†c{Ì.ï™ºC/$÷Œ=‡È7³étb\³€º…Sv½DšHIÖÑx‚Ù×ü5-¤z¸>i{ÄXä(ÿŠ hE.;+]WMœS;]ÛÎØ…ÚGÇ£Hß‰ÅûúÄ±Œ
+ñ–Ú¿ú,à¬ö¿¥éo>KpV~Ÿ÷\sse„–õyÉ|U	AYr—Ëó/¿“µPİ…š<E´NŸ3àò‰)”‡cJ>RÖf>S:#ÈO¢à+½­ğg.Ÿ?37 µÙùëİ¯_ë?½»ÿ^U[Ìï@É”ÚF•]¸š§±?^~y­Ê‘*œÃl ´-7ñ:İfû‡q•Å5Iü ŠãÈë“Gt"˜¿f@¤ğD¶²n;ã¬Î|ôîÌsçÓ3ä×ˆbBÜ’tQÂse;òV¯tH˜”œ†”
+p­©óâ‰åƒ($w‹y®’ç(ç$"Ë<¶Y4` XÂ÷€dËÔ5%¬‘qbª bşqÊ“V @æd³(eKSá&98IúàøìÛ>>Îä$p˜-ë’æú‰\Æä¯/¦Ÿa49Í¨¸?CÜõIÌgcD(dáu³‡=’W†q~íc'R¿Êhê¶p”\.­¸NzA@
+øªÍ;ï<Ó7éÙÍÌ-gF±6·GÄíÛtÎ÷ÁVL2‰jMºç6mwGÕbA•›¥i<dN˜h&Ì	ï[ÄxÇ½ =8Wp(†›f4‚²§~íU‰_'zÁ<…µ"H1?ˆ€±2³ŠJ„zØ*Ó!g™Cö+™¼|XæQ¯òI‘ãî$7‚°T>@X÷¬¼W"–P…®É£jmŒÖ–o¨ş“×îÛ]'@¡]U[šO~_€*³b+Y²ÌdÂåWímø†6kŠ¶˜ĞüÑ—¾]Ù=EşÜZI))ˆSí×;L?Wà·KkÂgöÚßÉï[FKûÅ|8g™Ï±úıı\Pïõ*± ÍRh*æcrZÜN	µ	ã2&V1å—	  œÿ9 +5¤÷Ç´2¡:;ñ";0{ùÿVräßÉÛÓtº{·®ç³jJ"&hÏë0;Îo½½k¼ñ¯=Ë´ŒŒ¬K\QäG/À'io–ädİõº9qœÂA}9ºœgDİàÊæSä˜²Õ5E»_¼øŒyÉ}.x.~É™BV€º°HMñ3<§ÀO‹Cµ{ìŠ%@ä)E{1A¼Oô«ığJ<³Ör–§6Œ'œWƒÏ Sğ³å&SáuE:v¨ğ#2.¿EJ¡.¹|í2¡QY&Á<Å€üq!TY£„³›e6é#&3Jù~€Ş‰ïçP4„Ïú•şã;«½¼GÅùÚ"~9äŠï—§¶¬^~¶ö@çWh€cMŞ˜& ãà•òº±¡–r£“<™œQêGûí/Tó£$mÓ¨\…»IïĞ`Qš½ãn¬‡Eq„!ÏéıbuˆtêÇ]Ãôr5ùk’r‰¯%ş^xåjõî;3H ^ˆÛCÿåk×L6›§ãÍh˜ì¤ï±*´Ó‰²êxät£({ÙX#öÁd\fnQLMÈh÷a?É Ö—öfÄù †¼­;l¿ôeÒânÄ+½$Z4K<¢GK.[@œ?¼A lÑnŠU ¾ÂK:Ú—`CY4@¡„eà2„ºôèfÒ
+¨,Ä†ã|Á'4“÷b*ÁšûÓìS8VFd¹ñ»åqMØ§8Áş§HBZÍ_û[&ê<lº$ûEûóeö­X2¿±6PP:*Éuá28Œi ûièï®…=fX¢8®iµC3$3ßïÕÔ¼ŸÄ4š?­³yÑ²µ)†ß¤¡™X.r²ÛÕøû´Ëoà&Ã„+ùo>(½t’ùÁ¢N™ıÙ½$oí|ÏÌŠ,û½ã·Ìİù~4Ì×£Ÿ‹_t&U=í?kÎµúÙ7ßûVq<½oª{ÇN{Mèk%ä&ÑŠÎlUò$Ş[ZËqÊüÃÑW<oÄ#Kç%X†ƒxZ@p®¶°,ıÚıÖ„X¦ğQGpA5ıÈÑë=>ôO,Š³²@Q4°BK—¬¿_¬©Ce-¤ŒÇ~§ïÏZƒís-ó­éÇ„s“‚öy¿òùKæËÀi4ßş>§ÙyğğÍ$HS3?(ĞquÁİÎÖÜ+=:n¸±Ëîº¹i&õë½7S÷ÎÔ[ïûéşÃ9?®YÂµ*ÌìœM©úĞ‰³õœ™¢ª Øí3¥— 0]Sg#WÌÁm&Î7Ÿõ:4ÎÆozy?27³ˆÒ6_‹_a>L,Üè’w>¿ìJ3tÂV>iã
+.z\ÔØÜ›·Â9…Ş*óÁîœ>ï”#¡íá3$Ä™ôQ·¼,¯ĞMY[ËCíco›7ÍËY7ĞX ~mı¿$ƒR?¶'ä:©›ÁeuQq"Yé³ÖÆ’@¦ŸÙï52u²fÊ\É'#¬ü“k÷ÊXŒ€T‹éü[Æõöò¦ó-ßKÕØ$ø+!bÌ¾İo£{,ŸíÔ1$±’İrbã¯‹bŒ81_n 	*{è™oÌ$¿óà_Löî¼gÚ]¿<<š1İujÓ¼Ñİ<=Jf†s¼rR}€{6®µ±§0dœPĞâ&ø_f'Ó”0ŸïƒÉÛDêÁñİnk˜~sñ¡Y#*ùöä^v\™ãrjFE¢ôb<#ƒä•‹š9S4”Äüº—Ó$ag›_Yj¼h/èñûly¯úC4ù i…¥Œ³|–¥¬ Ø"öXÿOüTYx±)dr!@'tæ2Òpµä4«qé×Ká#$Í…ø«ØŸ£-st®ó/ƒ¹WşBid˜ÉA
+8ì±3à×h¿ÍêşI»µéšüwÆ2¬0Âò{NæS™ò¨ÂîåøåÅ«­WÛÏ»Wª‹fä,Ì¼SWïxé;³w’‚ùı~Ì”±Ô6N¹k}*b¶ˆ‚tAMU+¤Ş4ÅÚ’Æ^ çï#¼D„°j0Ä™$š.Ärš„“óV0*ÈFxÁ$Cw»\Ğvõ©®yëèòRÜ5éröıœ²S9kş4snµYZ»Ä^>y‰²…³Ú  ³~Í2\:hWBc,â…x"Şèw–WĞè„‚°ÿ‰Öp0öğlFP£mùWIƒ“M7¦o,9³Ë¯6äµQ¸Æ'5?Â;ÚÆ­†QüLœÆ.°`+ÀéìÕì,øã(‰şısW»özÍu›«èêKáb„Ë}¶– ÷˜nHÇàìgíóÙİf¸!¥Ÿ*$õÛ×‚/˜n«ÍÜœ¸¼ç¾ôKŠı£Cã"z­óÈŒËaÇË‚,/K
+2³<#±É9q2ÔuI!ÌÜÎF6˜\Š+Ú¡ûŒµ¥ü”ªŸr4„6Œ,FÀç…ªşÀ¢gÎ¤áFIçïÄ[Åí;£ô­É½üÁ”$Ñ‚öú ¿Ø¿ìŞÀß6ClT»ºlÚí§[çÂ5bªÃE'öŠlLBC·h¹aini¯=ÚÇWâxd%D‡ŠÎ¢åro-Æã³àì¶Â ö
+HKóª#ô¤Ç@*œÚ'ÔÉ9‡¢4É=$‡Z8Á†á|mõëÛ+Ûlò³UÍ£ô×
+%í^îİfIU¾^‰({³Ü—æë3ç+Z-É®İŒ×ÂWü)°oI1Y°
+Â.µËÔ'3[/î9¯™¬²2)˜„Arsgñ}Vê<£Š™åXs‹ãõ3g°ŞªÇã”Ì{ÀıË
+{NÜï†û÷Úi›¶[Í`’e¨©˜QáÎPVŸ•ä³‰‡Q°8Î™Äİd^JCp~ÍÛroP%æ[¬cCï:3LœîF}­Õ¥³M°şÊZ<äaygœºåŞ¨1%-5£Š®ñŠ†Uè,Z£T¤kD{¹ë†¢¸'Ñ`%ñNšßˆ€xÊ´rEu*aÛ9ÜÒM´³l¶oDFØzh¯. @µ4ğÃñ?4ÜëÂ|ÇupšğY:»5R'àÀú·PİBxÛœMû¬iÃ 4&^·ÑŒƒ;—ãĞ5í—é%FhˆØED´Šbƒ†Kr-–ô= Õº=V|b^2P %”£Q® ÓÅÌ‰ÿÚ­n¸˜LXŠE_ÚLƒ·AŞ[g–uò^= 1-2SÓAB Unİz¸Ö&‘Ø”h›±9- D.kÃQÆ	férë³®ÔB@à>ß[¯³ñ‚1$4—TõWŸ!)÷ÌıûÇõM?q»Cb;zÖÇ´stXÒ½¸iT‚xÊôpx€Û•XpQ[DZ
+…ˆ„<*PSWÃ[½±›˜Õ‡†´«O§¯;–ßâIm|©¯­¾çKŠ¸ºâ›à;ı-C"ß*æˆÙ¢ns6ÆË +l¦ht–áœgi]ìŞàÒ³$@W'\™ÿÕgyÚÅu±NºaA!çf—:iÉß,è¸P§dg>R4KÛí»)‹h7¶%&'uq.0’&"üéÂö½1–œ+í6ØrpºKËÅİ…I&%x€˜ß°Å1ùÍ •¿,Òı”.N:™LP)mÀÊyØ£ıÀ¼Å9ßO§ÅÌ¿1Ø¾¼q‘ÄPföÉ|ñü%së!ëíóû4²™VUZ1q6‡I†İg½N=GËäbDS¥ÔDù%±Ö–G"Ñ'qTß±5ª©á7›=ÜÖˆW{xµûä¨Këñj³èÓ~à «ˆÙÒ>4ãQ>À‚1ÑÂfËšÕ¬|À:lYcŞí·gcÓüŞ{Sİ(¿hAŠ–öF,—£ğ‹Ô€,5ÈÁ$
+ÇŞî{Àç<÷©m–í%ĞêY„òãÛ÷ÿ óÌ‚Ì$Poçòƒ6™_²_V3¡©|¹&9ÎXÿï˜Š5=*.t©ÆM)Õ„!&±<hFŠ¡„PdÔÉøA&§ú,áÇYÎD¦„Ü}kÿ» vÖúz)g217‡å›ÇûæM}S§ åF^‡¥JêÙÁİwŞß®_ s‰k[š7Ì9å„²<Zšv‡v¨®¶Æô7ïÏşuïşÊ¥S©!{dË‰«#NùÎ	•%Ã¥“'‚¦7'V?l^­-g,bEü¨ª×»Ğ¶ßÊU<ºiÀvĞKfÛo-ÇõNoàºÂ­3Èí‘dÂ?J'iNİ`©	ÖHœ¹L6>Ñ9Á©Ô¼ÒuÛ3êí¬ÑK3¾ÏLš‹Ï©‚”/§Å:Œ˜"èx­áåE5'#[¯•"3³8¦¡á~JX1Ñc&@ë¼Q~ƒ#m#8Ì´tM;šı1A¤ë
+`¡¿¡¤ı,ûŸßÍ|óÌkf§øÀ‡å¼ühAË\XşğÅg^½ò›ÿù¯ÎèOğ^ıÊ‹¬ªjé#rŸØE®dyc©ÅŸe(¨–—¶CˆŸÀ£SËxÄbòò`Z¿q8ì€Y \[,Ò‰m
+^ÇèXm«W™b¤T€P“©VH_k—Ê–ôZêéj÷—¾è?+ÔV‚íM.óEC{™2Ókp» +ÆPÊoÁ!ŸXg@óĞd¦„Ã0rr€ÿæ @E X35Ëüö{ wr3­NR±PñbNÈÇr–Ç»óLKÀÂEÖéàâJv	Ú@*e04}È‹‡5–ñÎY´bA«§2wU¦‰<aiÚÔŞ%N% .ÏµstòÛf?çåø˜ù Ô&¨×z¬Èrà>ËÖ`†íçÂÅb>/ßÙ}#y÷¿ÙûÊg~ûŸı?Ì´ä”›a´éA*ò°Ó^Îj»¾Ö&ĞÉÿÙÏñ°oõguØÉ½Ñ‚…rñ«­±Æ«O½ÂX™|ëóõUs{‘²Ãµ%‡u5Í8V	ŸÇNÆq\Lfı‘//Ùà._cvaH”àİé¯´’¹á.¿bf#¡ü,Ûµ°Q‡x&X'²ª&Çy>‚R,„¯2u#ˆ[@Y:ä‹¼¿–+o.O*£ OŒÑó{¼…uºÔ–(Ûõü:³bvŸi-&vr ]ÿ$ÌU€ù¸–oôó¬Õó·_¡7`=ê—×sÿ5‹Bfcµen0I¼l¿XRÁ§§€Q&÷>œ˜ƒ½¢LwçîÚ°»ş·ÿƒ¿·ı—†¯„,uô]Î|øT9NŠv6ôˆ ¨=—úC³¼ÃZ#OØlŞşÑıO<nuˆX¦Mr ?¯ê²eçÙ+ŸâÙ3ŸdR›Ó#b¢F]‡475    IDAT©J¢ o×#ä#åjÎ  _-Ş0µëo¶™{ÏóİhĞ”ÓîEê®v¦5ı’€ë”)Ñ ª¦ãŒ~Jt—(,ìøŞ¥çzAÜ‹Ã€*’¬—œ)¯,„„(-‡8e¬D¦ôšÆ`•Š:ŒÓÅV'w/„egCÃß¤ÆÄa]©Rà§Ö ¨‚›ç	ÀÒïÍ‹ 7EèfÌá\ÌIaùd¯Ûçâ>Nqşö»Éá?ú/ÿ›è¯ıƒ¿5üÿı¯Yb.ÿ<g¿şLïO] ‡çEÇ\~ş¹Şı·¿3Õ"XOeîgºÂ9È²ûÌUdÍO7eY,›ÑÄSW,.é½ª•D·qL©A#5©Î™PßAÆY¬wÌD\u!©¦eUÀë[MãÜzí%S £×g~ÿf»¤£<¾àO9rˆÜDZñ‘-«M IR€	UÇÖ0‹¯F¿³.èÇ¸ó‹Ã6ö‰¾9üPUµª‚’£ïá+ğä±]pPĞoX†=ZNiÛañ8ÆËÍàZèE°ü`›ŠP¥2œ®ÿêßø÷Y¹º³óëÿÅâå´°Şç¹ÕCämfî¾ÿÖÄ>Cï®"ü	_=q·uOü¦Ùiù}–ç«ü!¦¿·©ä8³Éâ“1´œ#
+j:i~¥ä#ŠÔÄç²oÅ©Á!¡³¬(‚ùçs*Z:Üœè«¡œ	?d!ÊFêµ<>šƒ×“,#hëX» É¥ééå¼Ë9‘ÜAÙCÓéº4=D/f99õ–ŸÄ„ ,¨eàë Iëvl"¿³q •¦Ùüˆ¥ÊğCÅ”T‹2S©nÓ ¨{Óõb@õ™b°×+º½kí_ßş¯ÿùÿáŸ;úI78Ú_§uõş£òÂ^å±?X }Ç|`À³ÍûºáÉ³o 1“ä»­™·6£¹!ìwã>íáÊLÁ«ñV£”¿{ä~ìaògäAo™iJ”I¨ztåš¶×!"V£À0²œåxD˜a´pâ1Âu¢•S/˜#–'ÍjÍl3ı×^¿Wh‘a…
+9L¢b”N@¥
+Ôh9ñx^Ëq“QV3µL+×VqÍâv•)ÜÓ·é* +z(¹`¡‡Œ‡¤+YÊj•N1Jzç«t'gÙ"¹KÚÍ™c]
+– ­ëÕÇonÆoL>(¿ıïüQ½5z!ù£ü·Õ+²±2n	õØŸOåÑcÇıøˆ8ùbÉ@Y	¾\ª¥áê øj¥vÉ)$Ü®ë†Ú_ŠêpQØ™7ğN¬ÑoñtÒéûoüë?u%\õÏn¸@ØT×ê˜`1Ò:üM%ÂóM¾…­5?;<Æ¦y·M‡çí ¬Ó¢@UkŸ650÷NH/ÕŞï´Ã Õ° ¯O‰»ª’YQÎX"ÄÖv½á¥¡GB‡m‰ãÀ„±!sÄÎ1ŸskŠ_ÉÊa¤ît/+vÓ2;,}Ök3ß `¢2Á, ”«(è<9Ğ<%@)£qw«z^QAß ¦ŸFd&^p‹zh=üHmãuLaèR÷ÜâÖîôàwëÿ}ış§¿†Ájh$Bêx°ÜÄË#xub½—]sò
+Y=Ñ\ûN@©`Ç;7Ğ·\d;áñ	Ğ¤7é‘ctèÙM®Y¿Å¡ÙaØS2påîû_ÿåŸğ[ÿçÿ(¾<i§Õ’54LZÓü(a7)¸º<Ò—tèèqk¨¼2àD{´Ùàí  ,=BıŸ9‚,ãå{921e¥îÙ‚x}¢õú
+µ:Fd`•Å'ğjÖ»Á˜ ™\‹ı{G%Óéî¤ÛŠ¢°r-™øïn¨-4`©–Â«DOÓx„°9 æmDŸéÿÖ±0ÓÅ‰‘—9!æ»ÃD>»z5ùfìŠ
+	Ê	aa>PpUÁ	xœ¢îNÒ'z¯ê;ÿÙõë6µ°b:W°<¹SËŞZ^9ÆòRO=×E>as/ÿÖ=Mö8ùš	j7g[lõ-»5hbF ÅY6,€XıèEàšÂwûµ¾ã[ò fö{¿ı;`n[EÑ—v“°Ôz5ª-¸Pèzò§ cËLD¸î‚'0ñ$5ÍxD¿X–mBNºÂöæZpë®§¹¡¬
+O'ÀˆÓ—şÖSm³q¡•S-"$Âğ©Ù—Y}œSû™³R€)tlƒÅUS÷™¥Ï‚‡}V¥Ş®™TF”çI~Ğ{ŞÿÅî¿}îç¤Ä†…;Ü"ÃÈ|	n”EPŠ¶ ãí;­«‰¨ZËDnYŒšô-«ÅPÈÃ0ZKá††5eaæ’¸ˆ¨Â’ì¶ïàå<ydÓ}‹öø/ñrõİY¯öé•CÈ¦YÉŠÚÊğ“Õğd`‚M,/Ò¢q&“4ÿØ¶ÄºŸ¥X4‡Ğ¬Ï)ËÍZÏè=óâAÑ4v(	WSk±ódŞ£gï^\3ËÙ&àKBª=T\™¼é‡¦²³n¨zdµü8ı@˜eY½‹?1Èn½~Ö¡ˆ¡Ÿ3‰“q, Ï³,ì„U'¬¤ÃÍ*}Waa¤Z’wÀ«K/â6+	Şè¾j&U
+:ÜŸìœËşïHà6'y@ˆJëèhÓ’ˆC:”‹¢î1ywÆ‰ø|zÉ)‚X;–æÌÆ€éŞX¸œõªD‡†vµ¡‘¥­ÍÇ5cZÑş„¹ ºñdS4Kã9eûò?"(§Œ<e‘­(Q=’ô¬æÄ««­N%Æ©g³(ØMF¯·ƒ]rúº´
+È¼öÉ¢°q~e—›$`KYD€$:vNs¬&Uiâ-ë¹Ù”Ø[ÎÖG0¯ó`öĞQáHY mlënbÒVNe—™]¬9`¶Ûü€Ê‹²Şó,ÚÃ˜Ÿ€%7«émã_¹¼V#ZÀ4—ˆ2Â%Š†Ìû¦Å mG]ç‹šw¼—¼óÙÓûÉ?yğU÷êPDímÿt…x1XŸTÒœkçücMYGô µğ½k–´àá„|°\ŒÍ23ğY§pI³%mš~%‹ÖÈ ÊM„SY%:{ N%±‰‡öñööÃ©…GO‡ïìÕíúó:Ğ~âU.tÉ T Ùâ™¹Â2)CI{€	s-ƒ•§ap€8$W$<¹DÉmnÖ‚«(Î9Q:8®™Íôê3æ¿ó{ÙQ
+³<öƒ;Å1†iÇõYÜ•ìß&?6í-ÿşæu4_`ŸÑ"„ªZ2ušjÚÆêá1ùz*Hñ¶ØÁõ[Àï„–íáo–®s§şà¢µÒ‘ı%ÒV¹Çg›ÒM™P’Pº‚š"RZˆy+N3ı’’Çò^¬UÒµ¯±
+Òœ†ëiêgNØÏü£p:æ>a´§¡Œ(L¯!÷JÉ’¢‘hÂ;…––[h{Bgµçğ‰â‰x#‰WvSÄ¥“j[òÔN"e×«:Îv^ú™ÇJ’…–ƒºfsb]‰ú5ğfÓ˜–L¶;¼Eœ(×ªFÇjØ«Í~†¡ê©Ó*/o­z¨¯ùG=‰µI¾¸³n•˜ğó`=BUæÓoşoÌ9Xr[JsŞõ¯h};]&sU9¹92ÆáœÒÈÉ£Hf×{‡Ù ÇŠ`-H†ç`Í3cº&f¿\ğóátœÓá¹#_[»hhåÔÄhVdrhÑ×™Âä¸%CÜˆjÒ*¤@mÒßÌ¢‘Ö(İÑª½ı%,MDÑÈ2P_n––K®v‰†–öì°¼àhÛœÍ„dO½ü…Ä6\,??öbO¯§õp4‹0¹ù‰)¡è EÑs$Wˆ‹Ø„ü˜†ÚÈiv•ÅØÓ0¿Åùø_a˜ıı©E°æLf^çâäœ…,»4”•ì“S…o¸–Èæ˜òIŸ°ÓãqÔÕå;½l1?ü9°ÃÂl`]/õxoãöÎ“¨qªpmcçZúQ?,’JÌ®!cQ³£ï—ıµ²ZÏê9u3VG £ê=÷>sò+kÔQ¿óK<dÊô³ÉÿrøÍüõä£:cY†j|Ÿ
+$æ‹É>-ü¸|é&$2Áœe¡V2,¼Tî’(;`]œu›bwHXÙUdíìwXFÆ"ÚÚ#Ek½ƒö–¢<oDcL†¾µ¼³<dª±¾o­•[Y?HáÍj;yÇÌÃfŸ,›=ƒ§Î€)®ék™~!ÉÔô¨TûYR€9³gh†pENƒ´ÚK1Pe°ù$âplc¶ £Œh]+”,xÈ:20y¨˜ÉWŒTUOXp‚ùéæÅ”,šÒÔJŸ’}·™\Z/î¼sˆ©ª£ûêp³{»fÁçñ.¾ºˆˆ’vtZÆí–f]WÓ]RóŠã@r<¹)<Â­¿›A³hÇ|;ûh7ùFö½|”óäˆ	â4’¨e”Œ$-ãz¼ŒŞ2jBd‡ÕN€& Êğ·º1JŸ(¯nnP:ofÍ»~¡cO  ‡ˆÑ–¦ĞVÚ"Z‹æ¢ı‰u`ÄâxdÛ¿9‘åıı’—+ŞÚ“q	 'd¹WD”# –¯cÔø1˜Î`!3…Ğ²%ÀXAæ¥Ùqé½	†¡q6¾‹Á7ŞsAÒ3wÍ^vé^ó„…ÀD39š\‰fñĞ£Ç²`ğÂ4¿OËhxn+nçx^-ô¼»/7nZ$RH¬1¶r|û­[ñ³_bg‹ôìy
+ªğÖT‹¥A€u@–¬¨T¸ÖU±K¨àÔâ.Â£Ö5)iÙ(x€a8h»ë×:X#İ1-iÔöÊ42eS¿B—sq'Ş`=OÎÜ¶_¥,>ïĞİ&µÓº<ê$»ÊàÜ]¸Q1C&Â€>rxV—EÑD´$–fÒpÑß
+ÎÒÿë>‹æ
+O  <±¼aÄ ñL¼ÅKñÔòVãX&X<Rc²ÛÉ;•jW]9Bã¦÷Åš®Ê±®®–%Se} V‰Äûq“vp\ëó}f°ÒjôšPøŒ£2¾¢\~cÓÀ@%ˆŒ*aò4<’?d)y“fà²ô:!m'¦]æ]:îWúWü×öÉ×0kr÷è£¢çú	Ë3M³ßİõ™|YŒ–iÅ’|4ÖŸÛ,¦”Vs`]€p;1Íúù‘ÃÇAO«5³uİ1wKÅœ<¥áyª#åùmlÜ2ËA3-ƒÊâ7'ïåIruĞƒ„x¼¨Çä@ü?‚tÆÜHC!;U½ûƒ¹jQıo˜ƒ0C.:A…N¸UTvÃp¾ãZ4ıWÔ-ùß2ÊÒXB4—4‰ÙÌ	SÉ=«¨<Â#›Á‡w29g# k‰Ø½´ç—9]³	%Z°p"ì—Æs}ZU:ğSc¸	ù ¦[7`QòÌa ¦Otö¨.Àsİ•„ß³1O¾¦	CrPu
+™`Êèkyş•ÁEÓ­™ºí YáëÛ_ğúÇëÁ ó<³)¿Ø1ó¤Ôµ‚uÄSÀôL9*à·=0)Ù¸Šy ¦öq¹2ã‰ÖU:³ø¢Ğ
+ùŸ,
+ÇÉø®µaÖ(ÓKÉò²˜ŒWnPÅc1º‰™˜å_Zo›Ã#š Ì”ş»1…æü;Ô Ü	:ô<¬Ë‚d¡4“¥ıôÚ)s
+oôN±¬-PQí·Úûˆùç›Æ «)…ãt˜à4?ñÿ À]¯¹î¾Ùäÿ- |4@€dé—Û	»\)Y ‚h;ê¥æ'’!h¤OaÅ–;à€æâ`H™rî‹!Ê/£õ*ĞcÊ¸+$Ö¥(*Ö$@~¯¢kÍˆDkiÚnõÌ K“%(@z=%M¢–9d
+÷sºöY¨!lkéÒ¬íN8.³8à"Igw‚H(™¨¹ãpßô¼Ís¸Viì°&ûô˜õQèÌfÁî”‘°äx^tó8;–oæJ<SÀ_{õ ´6—âVøÔf^š{Ìô›¦3H´1#t¤N±èOØb…2=À…Xá~XFrPd¤q >Ã!&‰ğ,¤wgÕ'A®‚¾æÉÕŠÑ
+ÿfKÃe3‘R‹ 5¢=ÆÚ‹Íô.Ëÿ«Øiµ›ïhCZÙ	- LiP·’&uõÿºà‰Ğ	K ¶Åä-@D­ÊÏèd	+2éReÊ.
+£BÙl4 Y$‰k÷3p<.’a=ÕXRIúŞZ9H€•$–Eğiÿ¿Üm1Ñ?^:·nb¦^gG³Õí„×Ï±ä;-9¨K»ååÄ6ÂhEêZ^´¡Æ(Nòí¸^s»ƒ6;J–33¯«	Ç	²:'OÄRë¶è2ÃÜgÑĞ…“^«³ÅÊ ]ó*Sº_é\4od{³qşÇ»ñ´õµÎa³f,C°pxŒ×ò/àê8sú&Öƒn+JÌ%Æ’øEùiÇ©éYÕk×-ç¦Åí½ÃQQHK ©l†”B´ãˆú?¡­h-š‹ö²úx¢›° öÉüÃ; 5J€¦[ê¬ÿgòS–ëR'@ì‰Mm'8`iRXñ©¢¶ÁóM©|!¸¸ ¬¦Ã\n—HAi{>Ûh@3ò ±V€!57¬ˆÂFK+ ßÊBXè¹Pò›Ö™Ã?Ü-Õ½¾å¹·é!LÈ¦½µ{Ÿš:v`ı…‹Şÿ‹ÜgĞ§ÃÉ!Ï`ÏÓñŞJ¬ ú¢Íš—“y~P•<Pu|.Õ@M³fiû5•AıSÖÀÊÈêg<MŒÉÖ„k¦õ>ôòòubªıÑÄ[÷ûşîut½t¿|ÏoµÏ»şBxÀ”7 Í½²i0Ÿóü@Œám¦°.¡ç¦qÆHXG{°ÂÓa'*[£œ6nÊ÷‹&øcÕG˜Ş¤üD1Å,ª’öjZ;ô§ğ#”&“,·åjxÃaºğ<9ëÿùict,@ÁSêØAãÍ#â _aknRAI¤şÂl<ì‚@†éŒº˜^e!ğ=«h <Æ-a‡@¬òo2’TáWvA†×%@êù¬º;Â*D€'I®û<üFwA›4kób·2sw¶ËüÉÃüİÉ›ù½ôƒê|Ô®Gë<ìÑ‹6ËëQ×»wË§â/õ^ e†n2ªXòyœ©”Áƒ¡#I7¦Ç|à²Ü;dz	;ÕçĞdĞ¾Êãe‹-¿UlÖÙ©9î™q‘ßMÀÎr´C©‡õ6"Ì’ñyÂÔã–7¨7znúJ§å~ÙÏ§×cÚ„æjY˜÷T˜!²~;åq¤<ĞT@‡Lü…&¢h$Z‰f–vËÈJ4eÿ’Æ"ÉR¬Ì?=‹z‰İà•å™Ğ?</á©åAs€Œ‹wºÙOÿè;Çæ?~™PZÏdŠ$Ïÿcñg…ÔIq4‹B€xXã7ÆÚ4Ø&²cØ/f”ÃàªŒ$ŸiÛ¦…K.Kítüá{°·ÖD°œ=œJğ”dB
+®ØLŒ «÷²jo‘ÒOO½“Ò~ÉÄ|Šë)Øıé¸\£;çÒ 0š1òµøç)V×ŞªLXqÅ?x40‹rãíyö
+‰)Í$aæÓ·èîáNIÏ`W«”õX)¢NæbSJ P½£"I‹şb¶Wû}?ÌR<Õ‰5_é®»n'êLüô6ãŞ¥’|…L3ş)Ê»}ƒ`ıEX…—İËT±âSÎxJdİ)Î¯³^ĞFU<ğ—â+ˆ3ˆEÌAQéf–[ehòHÜ"¤•öã…	sÆä(}I!yH‰“ÉC[Qä,GdŸDŠ0TÄùşdİÀ-cXØ„ÑMİ¸ ÉˆL‰|Šõ/(À	­25zÖH¢¬‚fAˆûPQ)X{#’dX«Ø—;àTÜ¨n¦¹ß -dKìg—¥räËq0/÷úGÙ›‡w«Q0+÷¢Ëñ%u²¸
+LèpÅË«]gy5/˜Vß8~ÓÜÉwÍå¾Sa‚ÕÄ³(Û<cÅŞ‡Z†‡’±ãÙX¦ö°À4]ÈK‹íSD;—(ñã‹ÜÁú¿á17é=>™½Ë]VÍ©êúá:ë
+Jşs³în†¹s=ìºÍ<Yğ` ÒÓ<˜vƒ%Dxˆ$§À[]uãQß»P|‘n0Ø"@aDOğKf¾ÇS¦ãK¢‰h#‰V¢™„@4-ESK[hliM°&Ú‹âÅ0Z‰WKóoM¼å¥Ş-ãÿŒ%2´}õ¿ûWöUN\€5béì”HĞ~»´#@aà –¸f:¬½ƒ’–}ƒ™˜ikò\¬Àm¡Ysh~÷IÜ¥{‘ãíRÚğS4e÷GÌêaÅïıtßßâşiÙÓS‡˜Rİ~¢ûŒ3ˆ‚ä;³×’oì¿ÉšÀcs~­«;oŒîdß\|ÄóÄY’l€Dó)å…”ÕcIÃğ ^¦ÓñUuÃ(erê®’åş>ëmJ)@;õRVëbO$gÎ²È„,:/öéÿ¤FÍBÓ÷&·³ßß¶7×ñ_®s»Na»Í„
+G:’ÁôšA¸i·ôXDÍøş¿êÎäIÎó¾ïïÚoïİ³oX	P„(JŠdF–d;Vâ²ârÙª\tÈ!¾ÄåJÊ×üÎ!GŸrIÉ?S)WÊY\ÉqDÓ’h‘H@X˜½gz}÷7Ÿïóö; Š¤(ZyP˜™î~û]ß¾‡á’3½3¨7ë«ùş>>(@ Íßø1ëD"ìÛVî¥¬ş>«üiï`a`¢=Œ€00ìßˆò—°ƒ¾Ö)˜Wl‹L£9JØÏFF£4BZÂ¹CN5'Ğ4ÃŠÄ	¸yİtæçÜ<ØÂ±<™dÍò`<”Q‰‰«éÚºY*/¦òHßS` Š1ODxİ¡™»vlÓ³«q`¯%Ö„^Ş_K>˜İ‰~0ü›Ä®?J¶Ã÷q×>´›Œ^AÃôdíÊ1ÏÎÒN˜·Vˆ-1IR¦7Y$x`¨ôLäŞŒ|½ŞB—YÀ^­¾è3Ü7§3F"­×›Ñ¿›5İ«+Ş77nXƒt'¹õøfí[‹ëöUÚHü}wÑÿWÿáwİ«¯ã#"H¼Ş^¶ğ@gD9©U·òÎ+şdÖ³ºÁe8Rtj‹ufA0 PªU{õê×Şš=fƒŒò§½¥>&åQŞ?*Bé.	†Æüû+¡ñÅë9à¢yË\Ì°†ë™“…¶$=1GÉ0(d´O0\Nt˜ÏMâÀÈæT.Qa°[µœæ/±2A×iŠDØW
+_Î‰±%éÍÂéè1#iÂZOszZW±DR·ã3‰ÆŠ$iÓ\
+V¯Jh*`&Q‘ù;Ixt«^ÃMñØâ†öÛb;ĞÇp,åÌ'j‡í¡ã´èBòAÑòúòÁäpô6ò0~BuoˆXO²1…şW‰
+f]>Æµå¸é}Í¿†Dğ(.ê$õıƒó¹tüß­WÖ/ºËi“ušŞNŞbàÌÜ17=¬FÙIê¾RÜğúî…öøğ"^Já;%Ñ©n¢%!i/µ§ÈÊùŞA€ì¹ö^{|ªü	6œÀÀJH€UÂ ŸcÿçÑ@tmÖ¿ıÁ‘Å´0-²KrĞÇ¥•RÖc2!@M2¬x-_:uxPğ,iIÀM‚—hŠ¨Šˆ.ô<Ëı¸Ax"P
+VÎ‘(U(Xd~qGm×qéâdà¾(È’ÄQšKş¥O¦ë¬¹«n³ÖÈFñ„ôË!‰tÔòËf¢pù”ĞÒ§èõlgGdaÑ·'Í(E%"ÓßïnJĞõ¸Šâôv&Á”z‚ÅÜñH™Æ”}Ã±Í²„˜E ’0|¨¡y˜í¦Ş#&{Vİ½ÚëÑ{¦Èng“¼•Ş×WWlÿ~šşûÿòvş½÷xëA=?¹	î®³EÿÒ‹H2¦?Ó¶ğ®ÿŠ³DO¶–„÷Oş×ÀïÍšd
+Ø!©… ’0;Çä%Êk3¥$Êqfñ dÕÀø›Û“òÇ“²õÃéè=Q0 ‚ï°ßs[êû¬ü×k¸Î3«@ÎÒù`+·MšéPç2”z"/ '¥¶Î>æ¶
+ÆqqÀËŞaÓb àªDı‘_@Šš3E~ú
+Y¸  Z«È}Qƒ²Bì/ RËíÅ<J²caÿ¤_hÈ7<‚™©LßøIö¶ë“%‚+<<,6ÑäşhSw)»n“r¸C*dÀ±”B@jãœœù¾µ	ı‰ó;3º3åz§ª+ĞlÈ¸±€Ê*Aà%1^¦fğàĞ	H¯À_‡aÔh	 ×ÖÑl2ş³ñ÷1kâà¢wÉÛXéÅ?¸õØµN{w§¿;{:­=À3`cbSk¹ÆÂÖRüï~Æ7&õ^Ñìy-2´GZ\Q£»+íşR	!$ûM6Ô/x€aRşºbš>ªØÉ2¤È>>ªg‚?s òÙ|r ½ş——×]¥d$#Ë@¢ ­˜`
+ïãª¸ ¦&+ŠÁH<å<0\/:#çĞÃæIÕWx@‘û@obÅYLö"*©™8èP¾@M™ì¼³¡Gz    IDAT¢EäõÑ”ï„ûiÏé»]Ö
+RĞ"ğ¦˜’œ·‡àãËäë0?Ø>0 F9™øg\kĞQ%á`¢¶A@'9èSø«µİ·fôê“n‚ĞOÂ&ÂĞw–ıu{{½±ì¶\r¾(0ø«ÉO°‡è7n¾±ô¹ô¿İzDğÊ‹ßš=Ê&‡ñ¶ı.rí ná››Á†û¥b¸ï¯Òıá½ßbÄCÑºŸxş	,“>Æ&ùØş@ş¸aÿR ş†Ô¶aê—©ÇæSE†³ƒØ?ejØşTHCš …ÂÃÙˆH:Ú¿”È³Ú¿ £u€ZäF('J¹tÔ5£Hq+Ú6İSp”—7rŸnæ`÷UàOÀ
+æ ¢£çÂØ!L'81do† -é®CõpXÔ_yµhèÌv+‡ç& Ã£só„!¬)%—èol×P!¾¨ìÍ
+ —b¿‹KPÙŸĞt‘DLœ*®×ìã±"°MvmmqS‚%°Bº,ÂãmDØÃé„*?8ÕqÏ-º0‡8ã¡å_î¬ÒB´ÅˆÏ^ôdv|µq£~|{ßÚ¼¢œíôñlX<pfÙı„	$Ã±•´±îS½t½ÑŸ¾İø§ë¿ô(âûÙ»HJn§®,W§6;´îf1]KjÎ$}=´ƒ¸ÎuZIÑÏTYºÿbÒˆÈ5¨t’ƒ]ÂI$¢”rcğ<†›BpChBÌ"ÔÅF%õs9‘UÆ{‹M†kÀZsçOùóÎÓÏ Àëÿé'Ö{ßıüiõ¨LÂ¹cHÚ%JA‡şsˆIäPe.\í“°C`]’ıRZà¢N•JñX`)l&µ¨³šØëWç­œÈê*qB5ÚƒâQd¡Àä9#Ãú¨¿$k4Å-P·£¬Ñ¶íñ ».…b”S†K}8g“Ra¾™M"é #\M$ÎToÕÖ2k¸ÇÎÜdS­Öª7—­kı®\ŸÚü±µ’¯_‰/ùkv×}ıR—0CjK›?¾{òVNàˆxê™Ê”§Û“»Wï¹a0ËŞ=İøR2é|`¥ÇQØj3m<‹ë$'°_Vº>h›cfßòüµÁĞNßUp¬bı,{iÄa^³Çğ^ƒølˆtªK löMš¿ô¨ß˜~‚/ “ö’¢ğaë ÿøëüä¼t“q‘®F  kLé×>ƒ¢Í¿ù›Â(LwD†®t¤¬ØÇT„$
+„p\‚nPÀ+ààŒE`8`¨”qŠ)¡zuüğQ”$j œPÁx£Õ§äw#5â}Š%a™+Šqtqïˆt~èŞrÌ
+KğñµƒfzÑ]™-Ö–Üåæ×W¿Z4¢š·’5ëÿxñsÅd”Ú7ú}ïR¯«ş şf£^Ğ-/ë57&â38z¿õ×­Ÿ>Ù·÷£I4ÎîâX¤Ï<’±1ô³8ŞKX÷ã©}kZw¶)Y=†[ŠJ2/äZSõ«ş²íô1#_(.úÔ²>VøËô„!z!Y„Ò§ÄiÅúÉl¤R”$Ú8¨_€ jVO¥ªÑÔğò‚a)©’eàøxşŒï_3µ^Äşõ>¼âùeJ‡ĞµFŠÂ{¡Ã™lÍD…r‚4’6öa±\Ø ¯¹s)+*r†6)—£€CÙüÕã?&ÀQŠ}¶FADŒœv*ıCÛb
+©U_ñıÚ"	$Ü(IÍŞ‰imFHÇí»vD¦ñß> †}â(âH	•ñ±]Š$^9áXŠÚV-v;ÿüÊ·ƒ/5·jß\ù|:Š#—–<ÖëŞV²³³kmulçJ·imöûîf£ÁpGš¶o´§oË—šŞ¯}çÕô'ùĞûÎÚßsÿxó›ï.ı.Ä0Øö„(ïC/hb·x3,¶qÔ²ÇzJ4\($~#ßko_/¾’ì'3µ~¡·ŠC½çOózƒÂR6{¥=32^›½dOµ·ÚcöZ­cD:Æî*ê/€•@Vişg©ÿ…ì_‡>#ôF)Ş0ÉƒEh–í`È!¡n`Ü% "Îª‚˜duöhä ±5*„@V¤Áf‘-Ãuè±ELW¦»F³Ññ±’¢¡ryÃ}§ŞY(B`“jHİZ	Í€é1qV+Üü^Ó§ÄË`b4±ş±ğ›å<’Œ^s;õÎğj6GŞõö%k4¡&œ3 Ï"“2k¡FêJ6;½à•/m$·ß9PØÀÿÜµâáÎ^ş—÷ï 6˜ÓîQş73JRıxé!Itùááã˜ˆiı^”öÜ½_"F€8îò„Ùèm¨¢ñ¬şî6‹‹KÎí{«¾f$QrÀÌ×KôèEIíÇ`3¦Ä'd
+&nI¼bHğÖ/{'LCç·ÑÇ€L)û(&Ùo˜7«ÀÏË¨ŸC^Ìøª9‰II„Òc²ñÕ×P6¥äÍbEòßÜoQ
+‹Ø‡°éi+µ¡x 3D^’$Ïà
+:•¨¢¥)ğú®núCÉœML5ôÊ¶"x…bänO“ÁHõİš™ån×d”’h!JOÁ-HÃ§Wr/bº7%¾rØÿı×şapÁ^³ã¡síÊ²İk×İ-¯üÁ_ô®¯,‹ıôÎí]«±Ön|÷lÅ<÷x'{?zœİœİsš˜WLhZFşm#+şúè¾u}µçqu‘ˆ’×Ê¦İ@kíÖk	y5Ì&èº1§ú;¯YWÉ§»°ØÎğm.oX£f•ï›íŞ´éĞ¥àkÏ´OÚC³—ì©2ØccWiÏµ÷À ”ıpÁ®,˜“ı/¥~öïÅ0Y <‹xFF©=~á—nHéE¥( 	åø`½ ÊÆYdn ğ"«¤¡ »ô òê!ÑÕ<?ÇS$€F gbH&‹Ùíº‚jæišÒ²†GäãG!7ñ¤‹Á˜›ˆ{º7¾ª‰t]ÎÎÆ¡’UBŠ.İ¼lJ—á3,0"’seaÅMRï+ÿâ5ÿ}ù»ëµ¬şûÉğxZíLìå½¾¿“ß¿·“õÈı»ÂPß€´ÿ­	×|ûğ6'Ö¥î :w0¦{‚‰â.ÅÉŸELwêîk_Doáúp~rJ£:¨[ÇGÖÍ1úJèù×6(¾çök—Š…n}ïÀıŸ³oöH{eöÌø®!*•¨±+ì-¢Î@K¬Ÿ­.³5‰s˜”Z`Ufvó°ï‡Q¿à9%Po*Tø‡ß¸`ÓÛ‹€İ—½®>,cºTi¬F>9{´7‚b	ß€d“¦‚có°÷ªêáöWQ6÷S	^&üà=ÕÑ|ÎM âÊÁÌ¦¦>o.µ/¥G»Ql5ˆÙdX@L~B&ÃÂU¯Àd$à–#G¸€Êğ`}lR‡‹´â|³ÿëîV¾‰0fØÂxïˆ©“çµŠ?Q)·ê”…-|
+öÖÆ²·úí«ùåVßù_ûò5_\ELÛ™¸ÌfóĞ'ÄgûÖN<.½4ÙÓ·pï•bÀ¥‚´î&õÍı´y8M§µÄg¾Œw¶óQÈ˜4ğéÁÉQa/>ğº­VM#º“İ%ƒÂ±õÙCL>—2$:ÃŒ>€ ÖŸ"˜*ÅOî>={‚4ñ›K˜£.%'õ"’]ˆdÕTa_½xÑz!èÀ?|óÄMwLÔZ?.`n†«084!P»AzıT#‚W)ƒ•¤Ğ˜©ß•oGH d09ï)peZ™x”	-1~&‘ÉEs1Úwı…´İXñ/Õ]¯MÇ˜…‰P¦Œk¨ûÍñ(İšË’}!ÿ)œ‹eË¿ä_v/Gï%wÓ[“ç;Ş~¶ï“'hC¢Çö­»;EHÛWJÜş5ªH¿Ñs—~uÑ¶OÒäÏÿìo½¯¬\v;íZ¾7X¯¯¬Y·†÷ğYĞ6¦QÑïşjëÎ(¤ÌI­¶æ]¯ÿÚÚ›>s˜îy½¾âd
+¨c6HÎºç%Á,?<Ş-²¥‡Éd6uG§h1î1Lªáéd™-¶E	r÷2Îpñ<%ÙÌ°~)~èDÆå‹ª,§5µ…&…§L¢Åf`ı³¨_41G¿àGeB˜dr,HF\“Ö(Ät@6£hÖlSÆ›s…1*<ez@„ã_©İbÇbC—â€kb¹3JA	‘¨A£$ü}GŒwU§¥Uÿ"±ó–GKn=½^_küZ%¥4U¢—=‚,Qğ )»·î OkÍ ¾yüAòNò^¶7¼I÷$ºSÛ¥÷{ÓÇÉ_İ¿Eµ‘Êz9~8•Æ$Bfÿy_i/Ví÷Vƒö§¿÷+ÈoP<ÂhŞÿ±ıVfòğCE];~8İ-z¤zİÜùòÂfVÛwœëÁªïĞp®äM˜ÚmçŞŒË¨¹tF,‚bs’6úÖÕş
+Gı±&2ÒÂ _{FœŸ9HWöÒÄğÅ˜=Ö^³çÏ°~`b?#hª‚çüPÙ_û¥@¬ã~e“‚gŒxÎëò¥( Ò,±áì¥›XŞU:³Œ #›XÙïªä'@gã~cè)˜âxğ¸»fP×'L†ô‰Ö®{íÙº{qmÕg)C¸úîBw- ¯{'o[mz;áÀ(—@PZ2EEÆ7F“öZİ™Ìîà€¤#,±Ñ‚Q×0dCƒWzW’½G2‘½|‡ÙÉîĞY`†—ZÀ¢GXÖmìûY‘n­ûÃAñød/’gYûêz:ÎÈ"Iğìñ`BöÓÃüd¿µõjö££'ŞK[ùƒÙ6(i§Íøn1uÛÁŠ·FÃJãŠ×Z¹NáhöŞ“ş&ÖÕKPøYàSU
+:³›HMüşFî7Èÿg“²ÇŒsÆÈ°©bı(çÑ~`Ì¾Šõê°^Š ú,Lo)
+ä~dÂj„X¦¶ü¸¾Ub« “jV°µÍ u‘uªN‘@x©ÿHM»¢¬6‡«UîËÆnWĞkX/–hª°¿ë´W—8¬î-ÕW²ãÛµîVÛnÔ‰æ“Š‹èc4ó9#ô¿>¢
+'À©š…04ß4!¸ÂR¿c…CéòP^3İì.9ë+ıäæñm:vœ¿Úi=ş‹‡{€˜xçÁk{¶ã,tú…ñ¸·2'®«ZÔv(N¡w¸•,á‡ñ®=‹w=ÿÛl§xò§3fjºGBk³¶î½FçéF‘0Çuxt'ÑO§Å½a¿wèz(™‰]?—£9NI±>OÚ¯guD]LÀã<´64ë”õÓ_hÎúõşÏ’ıå—?p yÚ0LD%lÆv™)÷°PÇèÌ$ şîÔKôğÏJNTH ·G¹¯8%:%œ€ÿXäĞ«¿Má/\£¹ÊInÍÅ~XLÂ“]8¸îdÀA=”ñy=Ë¢ÉŒ$zLÔªÀUáRÚ§~€Ft~dÛ¹ßi8êäé(‡£ï/µñTùA§EŸ¿ŸŠıìÿßµ†ñN>
+o‰~¯¿¶æo^]³Š¾?ºı¤Ñ€İoÛÅA¸üö«_s²6½(ÛD¦h«Î0©Ï/oåÿg÷¾ÕÄD„o;İ`‘ù"“bİİ«Åó«Ñ]¬é0,fŞ$L¦ï¤Ş}é‚½x­»7s=¨O)ÿ)ğA.€QKLéí›’ç§´É)öÚcB>óhŸ<lÅŒí|•úuü‡r€¹ĞqFĞ:çf6±HO7œx°wü/8‹P½¥*\ş	T§H`ÄAL7 o¸˜<òÿpr°e°O™;À×È°Ñ©Œ[-ìêU4„qap½ÆÛ“÷í†~Ngé¡˜ıĞ7ÁŸ âñÿ4	AB™–‡VTd„„¨S}wÉi;T†m'Šûé±uŒe8É¦KEÇé%]gx2ËÆÃ0ÿ¯·Şµ¦ö°x<~‚¸¡Üp„ïÅcÊ7]ÂÀÚq4ò¶V?ëığü¯/ÜHßuœ<½oÙí™õ`òS”Ğ­‰şã‘Û¹9è.ÇÁø†¡ï3æ¢íŸ‘ùsÊ7ÀOùì­”>#÷|ö”¬,6PuPº+›ÿã²~UKŠùÏ\oıÑ›æ8Ÿ€Ú8¶ëëDÈ FvmÊäö¶DÃË`.g O,¾Pã…Ò<¨4Í¸9´~tôé¿:å„ZXõP;ˆùSÄµ¼^Ë¼ËÌ>Tm¤ÑÒv´ùàÈÏºäpÌ™JtÒB2[‰X>ÖJ—¶¯C•ıÂÜåÕ ;z€yÁtuúõ¤³Éaš‚S*ŞSE Œ‡‰ç_ó/›õ×°ÓgÖ‰»#¤î_E= ‘ûŞä º7Á¶Wj¾±ğªıîkÅ_Rd¾7y¿hP!4nÜ#kÉ‰r:€7˜V>“-‡ş0Xˆø>xfùMPƒü¼V¨q!€DqIi6À^I4J‘¶Ş3À—¦t«ä>wŒÖ_(Ô[±~(_ìõc-©e¾m.„³y¶¶¿L$R_^BÂÊÛF1¤b/$£´5£<â3ó3XyÍêxI‹v€ì*EÃ‡@ƒDã F¯ØCÙG(tı&VÖöRw™ ?Úr°çø‡tP­A”$ù}ˆX&3è8 IEùŒ¸ÉÑüFãâÅ‹ñ·ï†‡·©Šßğãéà¨æÀK]Ÿó–&“C»87BÂ¾Å/üÑşóŸNî6¾½ò;Î:†Ö»«n¡Ÿ¼{ÿ~òÓtßmó mT€Áì(=Èw½»Özún|›(m˜£+
+†¹7m&û ìã$Š†ÅH'@OnÚ¹¦o²ªñğ1ààÀaõôáù_|yûàÙŠø%;ô¾9|¾ÿ±¯k~¨˜ß”Q(şõ·.3W	­…„Y6ØøÔ?ÀÆË2à±ûùV)Œ£µN^<ã¤ 7Àä©ãÉVÖ‡?è|ˆç€OD½úÏ>¾“Õ®/Ô¢½ƒñ,¥& šâŞC$ø-»¾z­çÇ£œâXî&°Œ˜Y$ÌsÌ¦ŒıÁÆ¤=ÖSwí1ó¹û}:²Òò‰ÌSÂ5H8:î¬²³¤<ÍNk.23gÆ%•Á=³‡';ù`<p7Ö/'ßÛ};‰ÆÛ^c«—Nîf“¢½äöøáf 1šØ®[ÛhN­èıY7œ’jÈPi(P.Rbª(qN!ı™üP˜qî —YÄû ‚ÑöqIæÏmıÊÜcŞ)”/àk!ã=<AèOgM¾#÷Íyæ?>èØ?ıß¬÷O^·3R'E™E)¤$dX„JËà<G‘Ê#ÅåM!|åŠ2‹z~
+°è¡;;~’Ñ(×¡#`-vfcQn‰–º”z4Y=Ióª±§'†eÊ½TgWÌèw%¥’äEÛ5ÊıºÉ®\¢]Ğ^2™Œ åÃ-Ÿà0íRû8±bú¹eTîÔ°Ê&Ño©@^sË~aÑ®mõ¶¬Ã“]ª†TşÔJöOî¥Éè æQ§X%V®\¥GAÓZlj`íí´İŞŸGyïĞoÊU¤” ‘Ëà@˜|`örğàMÂ½;÷È¿oL=ˆË„wÏØúÏ î+g«˜Rö8_Ké«¾TışÈ /üÉo^²ºuß> ”Nşš>õÆ2xŠê¿&NPÈ[H‹M(œ$EŞ"º¦”2ƒ2Éª€	ËÀ[ËÃÃeDĞ¨‚a|û	M—G‹?â%¤Óóâ£„9|MÚ>§í.	†¸%I–òİÂï$Pr6è…ÆmYŸŒãÕ	óötRá¥vœÈsšíV´)Ë‚…0qÆäíàŠÂàAk˜}È‚v°lšÇ¿—ü(GÛù¸ù¤9‹t™_á>3¿Ö¨§ƒİÇyà5“F¼¹–$ö!u†hF &€ó1@oÁ&›Mi?ªñ¢AÜ€‡±‰ìÑô†áTÄÔhûˆ†JæW”ğÉï3¿’<>©Ò'8]I	<û…âO~Ó“ÁtsŸÚG„|ı˜„K¹¶tU‡ƒbéÁ¤øù-”²ˆ=…­¥¤â€½(µAî£ìƒ"ÀiO’æ7û›±.äÒ51)‘@†”}§ß_¥Êv¸ıÉ$Ú}Â.
+°åä5üû‘%”¬Ã]P(MºŠ‡"!³Ö#~Åè,¸5ååí àLèvR_›Ç\€éÊe÷»ËŒ€Íœ‘İŠGûÃœë:KË´
+Nâú`Ütj«ÊaM²Æ qh-İiÑ&7³áÜRôçÙÎÈzÔß§ÉÊæÑuøG"`AÎªñ¦zô äRäûÎZ§¦a74>f¸qöT)^Ÿ”íÏŸÑüúDÀ7í¦Ö	1€ç`nxè	h¦f¶àc!Ø²PÕl_Â_%Xƒ4rw©ÍP>™iDÁT sX‚,òúö N5Ü]¸Ğï,MÜ¿8„{ aÅE@â¯ø“e¥Ë»(yB¿A§pC‰ì‚¤¤Ğ¦sL‘W‡ÙÒHUi®âXÏN¨r>Ë$Z¢–ËT¼	FÔÉÍ.˜èJ–&`F·ç”&yC9j¸Šq2#1Ì )S½#‘Gg1‰Î ÕÃòŒ?•÷º?îXş}İbÖ8}¤ğ™ß³ÀW†O…¬æ1?é º¸ ë9$Ğ›X6{iLDÙ÷NH¾hî š—™Øèh4DœÇğyÃ*sŠÒ< ‡şÌè«ó^ù}IâôÌ'ãQõP5¬D×QXQ1B‡¯øgœOWË[QP?Á±*‡Èš$›Ò‚ÎmD’Êx„{³½„28kùu¼| 3ãsñr£>ëŠRà j<Ğ%Å§¡©ÙCÇCyAWQ’«pgnş‰ê•ï'–¯*ñ*ŸOw(ê‹®s
+üäÀxüÎRş§|]Ólšşø¸ë<èûÍ³Ğäñ”ö½2‰€BÎ,s_ä¿	B„97Pôr;Ioƒ"P¨eü  õtX-ğ“O:”jBĞ’¶úQ€n5"cå3).€.fÖí˜<Â "ÖOJ^¤î#}Şg5í~ß¢p°|-`s¶ùœt%}^½¨]%r
+’Vú)H:ÊQJÀë{ü§›	èÌ©§aùòãŸ•÷z~ãä‚IáS íŒ—ïS¾ğ#€¾\!:%@+˜Eè 4YB'nğœ^ ‘ ëÎ¹Ä·t¤!
+<Ÿ™|mÿ+ \v„Ä ÄƒØ=d1¢<ÂW5)KìÕlµî‚% #^ô¥g›Ë×<2ùqİM•NTó@ÔûÄd‡ yÂé€^yñšr•w[RüèjÌHÂ+©íh”\DZ?bMVLEñåHÅ6>B„ç$š?€Ì³xuS–FŞ+²Wt|¦^ù /şùs!€Ny	>ØÃK*©)3Î!†1üX€ V±jËÁpìX4(ó¾tM¹oJ¢\»%"ù.j `T†½³1B¢¶A¬I\ñFL€p[ĞEÊ¥yd!bÃË©$kTWÍZ¬ƒc«ÑîÛöĞµ1İp[ÊcÁĞ´”»Â=©«ÖœÒQĞ¹šrID’V¯Rît-<yæ ^Ş<ıWò¦©ÛS_"ç•rceâ)‘³bùU>ŸÜ»ç<Ÿ†ÂgäÜŸt¾
+	 Gë‡	äìÁB0—›‹„ Ü©•Prm‚r—~ ÄÄ¾h`³îšæE…Ÿ©¯ÓÚ‚Óñ™·tŒÑ!C5<F´Ò0œ•Œè±59ÂA„«X ÂjqëN
+ âx/úiUÊ3R9Ì­@ë/Øº
+şÂ´d>‚ÔM5c6q‰ès$¤òò	YKVÏç¢øSÀŸa÷e9t§Z>*¦²ñeæÍ5}·~.;_'ø°õ© €.ğ$0±é§"¡ä¢_£@A4õ4bá<" ÖêáğCI€\ÈÄÆnéÇãIß{³/ì†áô½˜ìqJkJEĞ±òK¸¼İªÑ}4n¯2*ø(÷IĞıBô‰"ò˜2ÓÛÂTäó>Š„á°Í± T75Ÿr@Vjô: êWƒ<)wUsÀKÁccPô¤á³ÄîU·g¼zz‡Ó‰ê+–/ï(ÿ³¾îéSC ì	øû	‚}›V?ZÏq½)Ÿ¶Uí›TËŸ°WúYÉú™øò˜%®€»Ø^ziı•BáG÷éö$m¾<Æl*:ZŞÉûªEËfF\ÂônH¼a~à³¿”, ú@)iÅ´Zã¶Œ(Ğ¡úD@Ú¼@—R*n …Q€WÆÎ©Œ×±sÀ›º
+˜¡j,dI˜{UL…¥€ù}êõŞ/ŠíëÜÕª¶­zısÿ>‹çDÂœ ÛÑ'IE¨FV‹#°•~ "P4ƒn U@²Ílœê	­Iİz5R;r»Û …T)‚Z‚¹¶Tä?_õ0²ífUò3Û]}rîwùYùS Ôô[v¯)"úP”®·ÎP;¯AãY$ãEÙú\épçÅ½À7ÛĞ  7IDAT§‹Ë§Ï×>cª/ï®üyºIgßü4ş>Eô)‡riU#ı}*DáÒXØzFQœ‹Ş@óƒ±Î¹_*‘©¢ñèÔ*Š(KªÆl—^*:Ù§È¡÷>lI¦k	ñXPP¸¸ƒyÍ•¤»¢Ğ)—E@ç?ádı­8š‹îV¯òúRÁ3zƒù\¢À”kIÃçë¼¬×{ŸÕë:Õú…!€.pŠzqFAÔË*·@ŸCQ0ğ#Is*J® \ÈPqât”æe6LeIèœ†»”àÔK³„ /Z€ù¬<€køZÈóªñ’ âÀÅõ¿¢ôù=‰ÚÕ–EEN(wå™ÄÛ„ç NÃ×e~¡Š.ğ²õE€ê¢gA>ƒÊ\ÔççMÏ°é—wXq±Ü92ˆÚø¼¤üS„Ğ	Ï!…Şª–äEË˜hç?8l}&n¢ÿZç€.dä»¨](¤]'…Dr&*ˆ£uğÙ>kŠ77ræÇg‚ ÕõNnğädfíñği3YgA¾ƒÓÇ•x˜o¬Á¸íaõj€ É,Fg˜Ÿç¤8¤”º`u/ÿ-V.;^ë,°õdƒÊ™Å5ÉqDù3‰èO^R»ù¾Båú¯õËxscüøL ºè$ìóˆ0×8TˆAq-EÃh`ô !D	"s÷Œ%¡ÔqÉc!…ÖÜª0ª-ÿzñÏŠ›ğ©QŞôÛLÓ” —oú'¹>ìİ°yµi“ˆ)©½¼÷32Ş|ãïšÚ_ôà'PİÈDG°+³QŸŒÿ ¢@ dx†3ÆRõ»V(-ÄĞ·xnUÇ¿àéMS¾` ­/µt¼nE”®ß¬§”^Ş£¨]şûŠ³ı2½¼óòç¶àìÇŸíß$ŸV|æ¾^†Š5è¿Ñ„	‚µşg´*@—¯>úÏêê mu9mô¿dïs,àJ4)Cù£6QôËô³Q=êÙ÷~)ş>ƒÏİaNX¹J*¯ô†ê·	P™‰ÏèÜgKÇV7GÌe9;øé7ÕOáÿçõÿ Õ_ÓÒ"i    IEND®B`‚€¹*             µƒ       E             ƒ  µƒ  PreviewAssetData   BaseName:
+  mainRepresentation:
+    serializedVersion: 3
+    name: Explosion_00080
+    thumbnail:
+      m_Format: 5
+      m_Width: 16
+      m_Height: 16
+      m_RowBytes: 64
+      image data: 1024
+      _typelessdata: 00ff804000ff804000ff804000ff804000d05d2f00df602000e6661a00e6661a00e6661a00e3551c00db6d2400cc663300cc663300cc663300cc663300cc663300ff804000ff804001cc663305df60200bd862270fe1691e12e0632514de622012db62230fe35f1b0cdd662206e6631902d65b2900cc663300cc663300cc663300ff804001cc663306e5611a0fdf602019d65c2926e55c2824df611f32e8581e2ee5522134ea56161ee3561c12e564230ad8622702db6d2400cc663300cc663300cc663303e2571d0edf60201ae2621d2ce56d2878f8783738e45f247af6731fd7fdf78364f3561f95fa8f1b5ef74f2414db612409ea6a2b01d2592d00cc663300d5552b08d8622716de612025e360223ee7742f45e25e264be45c2167ed5c249ff7802f8ef65c18b2fba93073f74c191edd652111e3631c04e3551c00cc663301e15a1e0de3631c1fde61202fde62214ae6653881f2691ccafba71f71eb623470ea561889f25a19a4f96e1d3fe55d2c27de622118df631f09d8622701cc663302e7611811dc672225e0622237df61204ee463208df15a296be66f2788ed854166e25b2280ee552058e55c1c3fdf61202ede63211ddc63220ddf602002db6d2402ea6a2b13df631f29e0641f3dde601f4ce1652270ea621b77e9732373e66a356ae35e1d9af2774d58e45f1c48e25b1e33e1652520df621f0ee2661d02df602002ea6a2b13df631f28df641f3ae0641e4ce1652259df642166e36f2779e9792b71e66d2f5fe0612056e25f2661ec5c204aed701420df611f0ee2661d02df602001e7611810dc682325e1612236de622046de632054e164215ce164219cf35d1976e9743c59e0621f5ce6591daefaae3744ed67221ddc62220ddf602002db6d2401df60200ce3631c1ede63212ede63213de063214ae0641f53e0611e96f45a2099f5602961e8601a58e8611e4cec5a1f2de35e1c1fe862320ad8622701cc663300db6d2406d8622716de632024e3622231e0621f3ce1622170f15a31d4fce146abf98b27b8fbbf30bffcdc4530e4631a32ee602817e3852106e3551c00ff804000d5552b02df60200cdf602018e0651e23e2651e2ce2612278f657164bea562869f45a15d2fdf67552f25c215cf7762e15e2692e0bea6a2b03ce613100ff550000d5552b00d5552b03e3551c0bde612015dd66221ddc612325e3691f60f54b1f69f65d3267f88a2e1de0602312e35f1b0cea6a2b06db6d2401ff550000ff550000d5552b00d5552b00d5552b02df602007ea6a2b0ddf602011e5622013db612413dd622411e3631c0ddb5d2309e6661a04d5552b01ff550000ff800000ff800000d5552b00d5552b00d5552b00d5552b00d5552b02df602003e3551c04e6661a04e6661a03df602002d65b2901f2793c00ff550000ff550000ff800000ff8000
+    guid: 950ecadb647534011a6b8632a848776b
+    path: Assets/2D Galaxy Assets/Game/Sprites/Explosion/Explosion_00080.png
+    localIdentifier: 2800000
+    thumbnailClassID: 28
+    flags: 1
+    scriptClassName: 
+  representations:
+  - serializedVersion: 3
+    name: Explosion_00080
+    thumbnail:
+      m_Format: 0
+      m_Width: 0
+      m_Height: 0
+      m_RowBytes: 0
+      image data: 0
+      _typelessdata: 
+    guid: 950ecadb647534011a6b8632a848776b
+    path: 
+    localIdentifier: 21300000
+    thumbnailClassID: 213
+    flags: 1
+    scriptClassName: 
+  labels:
+    m_Labels: []
+  assetImporterClassID: 1006
+  assetBundleFullName:
+    m_AssetBundleName: 
+    m_AssetBundleVariant: 
+  externalReferencesForValidation: []
+AssetInfo_______­  

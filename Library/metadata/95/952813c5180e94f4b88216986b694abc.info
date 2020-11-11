@@ -1,0 +1,558 @@
+t command, check that object creations are paired with object destructions
+  IF ((UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) = N'ACTIVESCRIPTING') AND (@database_name = N'VBScript'))
+  BEGIN
+    SELECT @temp_command = @command
+
+    SELECT @create_count = 0
+    SELECT @iPos = PATINDEX('%[Cc]reate[Oo]bject[ (]%', @temp_command)
+    WHILE(@iPos > 0)
+    BEGIN
+      SELECT @temp_command = SUBSTRING(@temp_command, @iPos + 1, DATALENGTH(@temp_command) / 2)
+      SELECT @iPos = PATINDEX('%[Cc]reate[Oo]bject[ (]%', @temp_command)
+      SELECT @create_count = @create_count + 1
+    END
+
+    SELECT @destroy_count = 0
+    SELECT @iPos = PATINDEX('%[Ss]et %=%[Nn]othing%', @temp_command)
+    WHILE(@iPos > 0)
+    BEGIN
+      SELECT @temp_command = SUBSTRING(@temp_command, @iPos + 1, DATALENGTH(@temp_command) / 2)
+      SELECT @iPos = PATINDEX('%[Ss]et %=%[Nn]othing%', @temp_command)
+      SELECT @destroy_count = @destroy_count + 1
+    END
+
+    IF(@create_count > @destroy_count)
+    BEGIN
+      RAISERROR(14277, -1, -1)
+      RETURN(1) -- Failure
+    END
+  END
+
+  -- Check step name
+  IF (EXISTS (SELECT *
+              FROM msdb.dbo.sysjobsteps
+              WHERE (job_id = @job_id)
+                AND (step_name = @step_name)))
+  BEGIN
+    RAISERROR(14261, -1, -1, '@step_name', @step_name)
+    RETURN(1) -- Failure
+  END
+
+  -- Check on-success action/step
+  IF (@on_success_action <> 1) AND -- Quit Qith Success
+     (@on_success_action <> 2) AND -- Quit Qith Failure
+     (@on_success_action <> 3) AND -- Goto Next Step
+     (@on_success_action <> 4)     -- Goto Step
+  BEGIN
+    RAISERROR(14266, -1, -1, '@on_success_action', '1, 2, 3, 4')
+    RETURN(1) -- Failure
+  END
+  IF (@on_success_action = 4) AND
+     ((@on_success_step_id < 1) OR (@on_success_step_id = @step_id))
+  BEGIN
+    -- NOTE: We allow forward references to non-existant steps to prevent the user from
+    --       having to make a second update pass to fix up the flow
+    RAISERROR(14235, -1, -1, '@on_success_step', @step_id)
+    RETURN(1) -- Failure
+  END
+
+  -- Check on-fail action/step
+  IF (@on_fail_action <> 1) AND -- Quit Qith Success
+     (@on_fail_action <> 2) AND -- Quit Qith Failure
+     (@on_fail_action <> 3) AND -- Goto Next Step
+     (@on_fail_action <> 4)     -- Goto Step
+  BEGIN
+    RAISERROR(14266, -1, -1, '@on_failure_action', '1, 2, 3, 4')
+    RETURN(1) -- Failure
+  END
+  IF (@on_fail_action = 4) AND
+     ((@on_fail_step_id < 1) OR (@on_fail_step_id = @step_id))
+  BEGIN
+    -- NOTE: We allow forward references to non-existant steps to prevent the user from
+    --       having to make a second update pass to fix up the flow
+    RAISERROR(14235, -1, -1, '@on_failure_step', @step_id)
+    RETURN(1) -- Failure
+  END
+
+  -- Warn the user about forward references
+  IF ((@on_success_action = 4) AND (@on_success_step_id > @max_step_id))
+    RAISERROR(14236, 0, 1, '@on_success_step_id')
+  IF ((@on_fail_action = 4) AND (@on_fail_step_id > @max_step_id))
+    RAISERROR(14236, 0, 1, '@on_fail_step_id')
+
+  --Special case the olap subsystem. It can have any server name. 
+  --Default it to the local server if @server is null 
+  IF(@is_olap_subsystem = 1)
+  BEGIN
+    IF(@server IS NULL)
+    BEGIN
+    --TODO: needs error better message ? >> 'Specify the OLAP server name in the %s parameter'
+      --Must specify the olap server name
+      RAISERROR(14262, -1, -1, '@server', @server)
+      RETURN(1) -- Failure    
+    END
+  END
+  ELSE
+  BEGIN
+    -- Check server (this is the replication server, NOT the job-target server)
+    IF (@server IS NOT NULL) AND (NOT EXISTS (SELECT *
+                                              FROM master.dbo.sysservers
+                                              WHERE (UPPER(srvname) = UPPER(@server))))
+    BEGIN
+      RAISERROR(14234, -1, -1, '@server', 'sp_helpserver')
+      RETURN(1) -- Failure
+    END
+  END
+
+  -- Check run priority: must be a valid value to pass to SetThreadPriority:
+  -- [-15 = IDLE, -1 = BELOW_NORMAL, 0 = NORMAL, 1 = ABOVE_NORMAL, 15 = TIME_CRITICAL]
+  IF (@os_run_priority NOT IN (-15, -1, 0, 1, 15))
+  BEGIN
+    RAISERROR(14266, -1, -1, '@os_run_priority', '-15, -1, 0, 1, 15')
+    RETURN(1) -- Failure
+  END
+
+  -- Check flags
+  IF ((@flags < 0) OR (@flags > 50))
+  BEGIN
+    RAISERROR(14266, -1, -1, '@flags', '0..50')
+    RETURN(1) -- Failure
+  END
+
+  -- Check output file
+  IF (@output_file_name IS NOT NULL) AND (UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) NOT IN ('TSQL', 'CMDEXEC', 'ANALYSISQUERY', 'ANALYSISCOMMAND', 'SSIS' ))
+  BEGIN
+    RAISERROR(14545, -1, -1, '@output_file_name', @subsystem)
+    RETURN(1) -- Failure
+  END
+
+  -- Check writing to table flags
+  IF (@flags IS NOT NULL) AND (((@flags & 8) <> 0) OR ((@flags & 16) <> 0)) AND (UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) NOT IN ('TSQL', 'CMDEXEC', 'ANALYSISQUERY', 'ANALYSISCOMMAND', 'SSIS' ))
+  BEGIN
+    RAISERROR(14545, -1, -1, '@flags', @subsystem)
+    RETURN(1) -- Failure
+  END
+
+  -- For CmdExec steps database-name and database-user-name should both be null
+  IF (UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) = N'CMDEXEC')
+    SELECT @database_name = NULL,
+           @database_user_name = NULL
+
+  -- For non-TSQL steps, database-user-name should be null
+  IF (UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) <> 'TSQL')
+    SELECT @database_user_name = NULL
+
+  -- For a TSQL step, get (and check) the username of the caller in the target database.
+  IF (UPPER(@subsystem collate SQL_Latin1_General_CP1_CS_AS) = 'TSQL')
+  BEGIN
+    SET NOCOUNT ON
+
+    -- But first check if remote server name has been supplied
+    IF (@server IS NOT NULL)
+      SELECT @server = NULL
+
+    -- Default database to 'master' if not supplied
+    IF (LTRIM(RTRIM(@database_name)) IS NULL)
+      SELECT @database_name = N'master'
+
+    -- Check the database (although this is no guarantee that @database_user_name can access it)
+    IF (DB_ID(@database_name) IS NULL)
+    BEGIN
+      RAISERROR(14262, -1, -1, '@database_name', @database_name)
+      RETURN(1) -- Failure
+    END
+
+    SELECT @database_user_name = LTRIM(RTRIM(@database_user_name))
+
+    -- Only if a SysAdmin is creating the job can the database user name be non-NULL [since only
+    -- SysAdmin's can call SETUSER].
+    -- NOTE: In this case we don't try to validate the user name (it's too costly to do so)
+    --       so if it's bad we'll get a runtime error when the job executes.
+    IF (ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1)
+    BEGIN
+      -- If this is a multi-server job then @database_user_name must be null
+      IF (@database_user_name IS NOT NULL)
+      BEGIN
+        IF (EXISTS (SELECT *
+                    FROM msdb.dbo.sysjobs       sj,
+                         msdb.dbo.sysjobservers sjs
+                    WHERE (sj.job_id = sjs.job_id)
+                      AND (sj.job_id = @job_id)
+                      AND (sjs.server_id <> 0)))
+        BEGIN
+          RAISERROR(14542, -1, -1, N'database_user_name')
+          RETURN(1) -- Failure
+        END
+      END
+
+      -- For a SQL-user, check if it exists
+      IF (@database_user_name NOT LIKE N'%\%')
+      BEGIN
+        SELECT @database_user_name_temp = REPLACE(@database_user_name, N'''', N'''''')
+        SELECT @database_name_temp = REPLACE(@database_name, N'''', N'''''')
+
+        EXECUTE(N'DECLARE @ret INT
+                  SELECT @ret = COUNT(*)
+                  FROM ' + @database_name_temp + N'.dbo.sysusers
+                  WHERE (name = N''' + @database_user_name_temp + N''')
+                  HAVING (COUNT(*) > 0)')
+        IF (@@ROWCOUNT = 0)
+        BEGIN
+          RAISERROR(14262, -1, -1, '@database_user_name', @database_user_name)
+          RETURN(1) -- Failure
+        END
+      END
+    END
+    ELSE
+      SELECT @database_user_name = NULL
+
+  END  -- End of TSQL property verification
+
+  RETURN(0) -- Success
+END
+go
+
+ 
+/**************************************************************/
+/* sysmail_delete_mailitems_sp                                */
+/**************************************************************/
+-----
+PRINT 'Updating sysmail_delete_mailitems_sp'
+-----
+GO
+ALTER PROCEDURE sysmail_delete_mailitems_sp
+   @sent_before DATETIME   = NULL, -- sent before
+   @sent_status varchar(8)   = NULL -- sent status
+AS
+BEGIN
+
+   SET @sent_status       = LTRIM(RTRIM(@sent_status))
+   IF @sent_status           = '' SET @sent_status = NULL
+
+   IF ( (@sent_status IS NOT NULL) AND
+         (LOWER(@sent_status collate SQL_Latin1_General_CP1_CS_AS) NOT IN ( 'unsent', 'sent', 'failed', 'retrying') ) )
+   BEGIN
+      RAISERROR(14266, -1, -1, '@sent_status', 'unsent, sent, failed, retrying')
+      RETURN(1) -- Failure
+   END
+
+   IF ( @sent_before IS NULL AND @sent_status IS NULL )
+   BEGIN
+      RAISERROR(14608, -1, -1, '@sent_before', '@sent_status')  
+      RETURN(1) -- Failure
+   END
+
+   DELETE FROM msdb.dbo.sysmail_allitems 
+   WHERE 
+        ((@sent_before IS NULL) OR ( send_request_date < @sent_before))
+   AND ((@sent_status IS NULL) OR (sent_status = @sent_status))
+
+   DECLARE @localmessage nvarchar(255)
+    SET @localmessage = FORMATMESSAGE(14665, SUSER_SNAME(), @@ROWCOUNT)
+    exec msdb.dbo.sysmail_logmailevent_sp @event_type=1, @description=@localmessage
+
+END
+GO
+
+/**************************************************************/
+/* sp_sysmail_activate                                */
+/**************************************************************/
+-----
+PRINT 'Updating procedure sp_sysmail_activate'
+-----
+GO
+-- sp_sysmail_activate : Starts the DatabaseMail process if it isn't already running
+--
+ALTER PROCEDURE sp_sysmail_activate
+AS
+BEGIN
+    DECLARE @mailDbName sysname
+    DECLARE @mailDbId INT
+    DECLARE @mailEngineLifeMin INT
+    DECLARE @loggingLevel nvarchar(256)
+    DECLARE @loggingLevelInt int   
+    DECLARE @parameter_value nvarchar(256)
+    DECLARE @localmessage nvarchar(max)
+    DECLARE @rc INT
+
+    SET NOCOUNT ON
+    EXEC sp_executesql @statement = N'RECEIVE TOP(0) * FROM msdb.dbo.ExternalMailQueue'
+
+    EXEC @rc = msdb.dbo.sysmail_help_configure_value_sp @parameter_name = N'DatabaseMailExeMinimumLifeTime', 
+                                                        @parameter_value = @parameter_value OUTPUT
+    IF(@rc <> 0)
+        RETURN (1)
+
+    --ConvertToInt will return the default if @parameter_value is null or config value can't be converted
+    --Setting max exe lifetime is 1 week (604800 secs). Can't see a reason for it to ever run longer that this
+    SET @mailEngineLifeMin = dbo.ConvertToInt(@parameter_value, 604800, 600) 
+    
+    --Try and get the optional logging level for the DatabaseMail process
+    EXEC msdb.dbo.sysmail_help_configure_value_sp @parameter_name = N'LoggingLevel', 
+                                                  @parameter_value = @loggingLevel OUTPUT
+
+    --Convert logging level into string value for passing into XP
+    SET @loggingLevelInt = dbo.ConvertToInt(@loggingLevel, 3, 2) 
+    IF @loggingLevelInt = 1
+       SET @loggingLevel = 'Normal'
+    ELSE IF @loggingLevelInt = 3
+       SET @loggingLevel = 'Verbose'
+    ELSE -- default
+       SET @loggingLevel = 'Extended'
+
+    SET @mailDbName = DB_NAME() 
+    SET @mailDbId   = DB_ID()
+
+    EXEC @rc = master..xp_sysmail_activate @mailDbId, @mailDbName, @mailEngineLifeMin, @loggingLevel
+    IF(@rc <> 0)
+    BEGIN
+        SET @localmessage = FORMATMESSAGE(14637)
+        exec msdb.dbo.sysmail_logmailevent_sp @event_type=3, @description=@localmessage
+    END
+    ELSE
+    BEGIN
+        SET @localmessage = FORMATMESSAGE(14638)
+        exec msdb.dbo.sysmail_logmailevent_sp @event_type=0, @description=@localmessage
+    END
+
+    RETURN @rc
+END
+GO
+
+/**************************************************************/
+/* Update the RunMailQuery stored procedure          */
+/**************************************************************/
+/****** Object:  StoredProcedure [dbo].[sp_RunMailQuery]    Script Date: 06/06/2006 12:26:03 ******/
+use msdb
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER OFF
+GO
+ALTER PROCEDURE [dbo].[sp_RunMailQuery]
+   @query                    NVARCHAR(max),
+   @attach_results             BIT,
+    @query_attachment_filename  NVARCHAR(260) = NULL,
+   @no_output                  BIT,
+   @query_result_header        BIT,
+   @separator                  VARCHAR(1),
+   @echo_error                 BIT,
+   @dbuse                      sysname,
+   @width                   INT,
+    @temp_table_uid             uniqueidentifier,
+   @query_no_truncate          BIT,
+   @query_result_no_padding             BIT
+AS
+BEGIN
+    SET NOCOUNT ON
+    SET QUOTED_IDENTIFIER ON
+
+    DECLARE @rc             INT,
+            @prohibitedExts NVARCHAR(1000),
+            @fileSizeStr    NVARCHAR(256),
+            @fileSize       INT,
+            @attach_res_int INT,
+            @no_output_int  INT,
+            @no_header_int  INT,
+            @echo_error_int INT,
+         @query_no_truncate_int INT,
+         @query_result_no_padding_int   INT,
+            @mailDbName     sysname,
+            @uid            uniqueidentifier,
+            @uidStr         VARCHAR(36)
+
+    --
+    --Get config settings and verify parameters
+    --
+    SET @query_attachment_filename = LTRIM(RTRIM(@query_attachment_filename))
+
+    --Get the maximum file size allowed for attachments from sysmailconfig.
+    EXEC msdb.dbo.sysmail_help_configure_value_sp @parameter_name = N'MaxFileSize', 
+                                                @parameter_value = @fileSizeStr OUTPUT
+    --ConvertToInt will return the default if @fileSizeStr is null
+    SET @fileSize = dbo.ConvertToInt(@fileSizeStr, 0x7fffffff, 100000)
+
+    IF (@attach_results = 1)
+    BEGIN
+        --Need this if attaching the query
+        EXEC msdb.dbo.sysmail_help_configure_value_sp @parameter_name = N'ProhibitedExtensions', 
+                                                    @parameter_value = @prohibitedExts OUTPUT
+
+        -- If attaching query results to a file and a filename isn't given create one
+        IF ((@query_attachment_filename IS NOT NULL) AND (LEN(@query_attachment_filename) > 0))
+        BEGIN 
+          EXEC @rc = sp_isprohibited @query_attachment_filename, @prohibitedExts
+          IF (@rc <> 0)
+          BEGIN
+              RAISERROR(14630, 16, 1, @query_attachment_filename, @prohibitedExts)
+              RETURN 2
+          END
+        END
+        ELSE
+        BEGIN
+            --If queryfilename is not specified, generate a random name (doesn't have to be unique)
+           SET @query_attachment_filename = 'QueryResults' + CONVERT(varchar, ROUND(RAND() * 1000000, 0)) + '.txt'
+        END
+    END
+
+    --Init variables used in the query execution
+    SET @mailDbName = db_name()
+    SET @uidStr = convert(varchar(36), @temp_table_uid)
+
+    SET @attach_res_int        = CONVERT(int, @attach_results)
+    SET @no_output_int         = CONVERT(int, @no_output)
+    IF(@query_result_header = 0) SET @no_header_int  = 1 ELSE SET @no_header_int  = 0
+    SET @echo_error_int        = CONVERT(int, @echo_error)
+    SET @query_no_truncate_int = CONVERT(int, @query_no_truncate)
+    SET @query_result_no_padding_int = CONVERT(int, @query_result_no_padding )
+
+    EXEC @rc = master..xp_sysmail_format_query  
+                @query        = @query,
+                @message      = @mailDbName,
+                    @subject     = @uidStr,
+                    @dbuse       = @dbuse, 
+                    @attachments = @query_attachment_filename,
+                    @attach_results = @attach_res_int,
+                    -- format params
+                    @separator      = @separator,
+                    @no_header      = @no_header_int,
+                    @no_output      = @no_output_int,
+                    @echo_error     = @echo_error_int,
+                @max_attachment_size = @fileSize,
+                    @width       = @width, 
+                    @query_no_truncate = @query_no_truncate_int,
+                    @query_result_no_padding    = @query_result_no_padding_int
+   RETURN @rc
+END
+GO
+
+IF (EXISTS (SELECT *
+            FROM msdb.dbo.sysobjects
+            WHERE (name = N'sp_validate_user')))
+  DROP PROCEDURE sp_validate_user
+go
+use msdb
+GO
+/****** Object:  StoredProcedure [dbo].sp_validate_user ********/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER OFF
+GO
+CREATE PROCEDURE [dbo].[sp_validate_user]
+	@send_request_user sysname,
+	@user_sid varbinary(85) OUTPUT
+  WITH EXECUTE AS 'dbo'
+AS
+BEGIN
+    SET NOCOUNT ON
+-- And make sure ARITHABORT is on. This is the default for yukon DB's
+    SET ARITHABORT ON
+
+	declare @sid varbinary(85)
+	create table #temp
+	([account name] sysname, 
+	[type] char(8),
+	[privilege] char(9),
+	[mapped login name] sysname,
+	[permission path] sysname)
+	
+	insert #temp exec master.dbo.xp_logininfo @send_request_user
+	select @sid = suser_sid([permission path]) from #temp
+
+	SET @user_sid = NULL
+	
+	IF EXISTS(SELECT * 
+        FROM msdb.dbo.sysmail_principalprofile as pp
+        WHERE (pp.is_default = 1) AND
+            (pp.principal_sid = @sid))
+	BEGIN
+		SET @user_sid = @sid
+	END
+END
+GO
+
+
+use msdb
+GO
+/****** Object:  StoredProcedure [dbo].[sp_send_dbmail]    Script Date: 06/06/2006 12:24:17 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER OFF
+GO
+-- sp_send_dbmail : Sends a mail from Yukon outbox.
+--
+ALTER PROCEDURE [dbo].[sp_send_dbmail]
+   @profile_name               sysname    = NULL,        
+   @recipients                 VARCHAR(MAX)  = NULL, 
+   @copy_recipients            VARCHAR(MAX)  = NULL,
+   @blind_copy_recipients      VARCHAR(MAX)  = NULL,
+   @subject                    NVARCHAR(255) = NULL,
+   @body                       NVARCHAR(MAX) = NULL, 
+   @body_format                VARCHAR(20)      = NULL, 
+   @importance                 VARCHAR(6)    = 'NORMAL',
+   @sensitivity                VARCHAR(12)      = 'NORMAL',
+   @file_attachments           NVARCHAR(MAX) = NULL,  
+   @query                      NVARCHAR(MAX) = NULL,
+   @execute_query_database     sysname    = NULL,  
+   @attach_query_result_as_file BIT    = 0,
+        @query_attachment_filename  NVARCHAR(260)  = NULL,  
+        @query_result_header        BIT         = 1,
+   @query_result_width         INT        = 256,            
+   @query_result_separator     CHAR(1)    = ' ',
+   @exclude_query_output       BIT        = 0,
+   @append_query_error         BIT        = 0,
+   @query_no_truncate          BIT        = 0,
+   @query_result_no_padding            BIT        = 0,
+   @mailitem_id               INT         = NULL OUTPUT
+  WITH EXECUTE AS 'dbo'
+AS
+BEGIN
+    SET NOCOUNT ON
+
+    -- And make sure ARITHABORT is on. This is the default for yukon DB's
+    SET ARITHABORT ON
+
+    --Declare variables used by the procedure internally
+    DECLARE @profile_id         INT,
+            @temp_table_uid     uniqueidentifier,
+            @sendmailxml        VARCHAR(max),
+            @CR_str             NVARCHAR(2),
+            @localmessage       NVARCHAR(255),
+            @QueryResultsExist  INT,
+            @AttachmentsExist   INT,
+            @RetErrorMsg        NVARCHAR(4000), --Impose a limit on the error message length to avoid memory abuse 
+            @rc                 INT,
+            @procName           sysname,
+       @trancountSave      INT,
+       @tranStartedBool    INT,
+            @is_sysadmin        BIT,
+            @send_request_user  sysname,
+            @database_user_id   INT,
+			@sid				varbinary(85)
+		
+		SET @sid = NULL
+
+    -- Initialize 
+    SELECT  @rc                 = 0,
+            @QueryResultsExist  = 0,
+            @AttachmentsExist   = 0,
+            @temp_table_uid     = NEWID(),
+            @procName           = OBJECT_NAME(@@PROCID),
+            @tranStartedBool  = 0,
+       @trancountSave      = @@TRANCOUNT
+
+    EXECUTE AS CALLER
+       SELECT @is_sysadmin       = IS_SRVROLEMEMBER('sysadmin'),
+              @send_request_user = SUSER_SNAME(),
+              @database_user_id  = USER_ID()
+    REVERT
+
+    --Check if SSB is enabled in this database
+    IF (ISNULL(DATABASEPROPERTYEX(DB_NAME(), N'IsBrokerEnabled'), 0) <> 1)
+    BEGIN
+       RAISERROR(14650, 16, 1)
+       RETURN 1
+    END
+
+    --Report error if the mail queue has been stopped. 
+    --sysmail_stop_sp/

@@ -1,0 +1,520 @@
+     WHERE collector_type_uid = @collector_type_uid))
+BEGIN
+    PRINT 'Updating TSQL Query collector type'
+    EXEC sp_syscollector_update_collector_type 
+            @collector_type_uid = @collector_type_uid,
+            @name = @name,
+            @parameter_schema = @parameter_schema,
+            @parameter_formatter = @parameter_formatter,
+            @collection_package_id = @collection_package_id,
+            @upload_package_id = @upload_package_id
+END
+ELSE
+BEGIN
+    PRINT 'Creating T-SQL Query collector type'
+    EXEC sp_syscollector_create_collector_type
+            @collector_type_uid = @collector_type_uid,
+            @name = @name,
+            @parameter_schema = @parameter_schema,
+            @parameter_formatter = @parameter_formatter,
+            @collection_package_id = @collection_package_id,
+            @upload_package_id = @upload_package_id
+END
+
+-- mark the collector type as system
+UPDATE syscollector_collector_types 
+SET is_system = 1
+WHERE collector_type_uid = @collector_type_uid
+GO
+
+---------------------------------------------------------------
+-- Database objects for TSQL query collector type 
+---------------------------------------------------------------
+
+IF (OBJECT_ID(N'[dbo].[syscollector_tsql_query_collector]', 'U') IS NULL)
+BEGIN
+    PRINT 'Creating table [dbo].[syscollector_tsql_query_collector]...'
+    CREATE TABLE [dbo].[syscollector_tsql_query_collector] (
+        collection_set_uid            uniqueidentifier NOT NULL,
+        collection_set_id            int NOT NULL,
+        collection_item_id            int NOT NULL,
+        collection_package_id        uniqueidentifier NOT NULL,
+        upload_package_id            uniqueidentifier NOT NULL,
+        )
+    ALTER TABLE syscollector_tsql_query_collector
+        ADD CONSTRAINT [FK_syscollector_tsql_query_collector_syscollector_collection_items_internal] FOREIGN KEY(collection_set_id, collection_item_id)
+        REFERENCES syscollector_collection_items_internal (collection_set_id, collection_item_id) ON DELETE CASCADE
+END
+GO
+
+IF (OBJECT_ID('dbo.syscollector_collection_item_parameter_update_trigger', 'TR') IS NOT NULL)
+BEGIN
+    PRINT 'Dropping trigger [dbo].[syscollector_collection_item_parameter_update_trigger] on [dbo].[syscollector_collection_items_internal]'
+    DROP TRIGGER [dbo].[syscollector_collection_item_parameter_update_trigger]
+END
+GO
+
+PRINT 'Creating trigger [dbo].[syscollector_collection_item_parameter_update_trigger] on [dbo].[syscollector_collection_items_internal]'
+GO
+CREATE TRIGGER [dbo].[syscollector_collection_item_parameter_update_trigger] on [dbo].[syscollector_collection_items_internal]
+FOR UPDATE
+AS
+BEGIN
+    DECLARE @collection_set_id int
+    DECLARE @collection_item_id int
+
+    -- remove the TSQL query collection item that was updated so packages will be regenerated 
+    -- base on the new parameters
+    IF (NOT UPDATE (parameters))
+       RETURN
+
+    -- clean up the SSIS packages that are left behind
+    DECLARE inserted_cursor CURSOR LOCAL FOR
+        SELECT collection_set_id, collection_item_id
+        FROM inserted
+    
+    OPEN inserted_cursor
+    FETCH inserted_cursor INTO @collection_set_id, @collection_item_id
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        DELETE FROM dbo.syscollector_tsql_query_collector 
+        WHERE collection_set_id = @collection_set_id
+        AND collection_item_id = @collection_item_id
+
+        FETCH inserted_cursor INTO @collection_set_id, @collection_item_id
+    END
+
+    CLOSE inserted_cursor
+    DEALLOCATE inserted_cursor
+END
+GO
+
+IF (OBJECT_ID('dbo.syscollector_tsql_query_collector_delete_trigger', 'TR') IS NOT NULL)
+BEGIN
+    PRINT 'Dropping trigger [dbo].[syscollector_tsql_query_collector_delete_trigger] on [dbo].[syscollector_tsql_query_collector]'
+    DROP TRIGGER [dbo].[syscollector_tsql_query_collector_delete_trigger]
+END
+GO
+
+PRINT 'Creating trigger [dbo].[syscollector_tsql_query_collector_delete_trigger] on [dbo].[syscollector_tsql_query_collector]'
+GO
+CREATE TRIGGER [dbo].[syscollector_tsql_query_collector_delete_trigger] on [dbo].[syscollector_tsql_query_collector]
+FOR DELETE
+AS
+BEGIN
+    -- remove the SSIS packages left behind when the collection item is deleted 
+    DECLARE @collection_package_id uniqueidentifier
+    DECLARE @collection_package_folderid uniqueidentifier
+    DECLARE @collection_package_name sysname
+
+    DECLARE @upload_package_id  uniqueidentifier
+    DECLARE @upload_package_folderid  uniqueidentifier
+    DECLARE @upload_package_name  sysname
+
+    DECLARE deleted_cursor CURSOR LOCAL FOR
+        SELECT collection_package_id, upload_package_id
+        FROM deleted
+    
+    OPEN deleted_cursor
+    FETCH deleted_cursor INTO @collection_package_id, @upload_package_id
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SELECT 
+            @collection_package_name = name,
+            @collection_package_folderid = folderid
+        FROM sysssispackages
+        WHERE @collection_package_id = id
+
+        SELECT 
+            @upload_package_name = name,
+            @upload_package_folderid = folderid
+        FROM sysssispackages
+        WHERE @upload_package_id = id
+
+        EXEC dbo.sp_ssis_deletepackage
+            @name = @collection_package_name,
+            @folderid = @collection_package_folderid
+
+        EXEC dbo.sp_ssis_deletepackage
+            @name = @upload_package_name,
+            @folderid = @upload_package_folderid
+
+        FETCH deleted_cursor INTO @collection_package_id, @upload_package_id
+    END
+
+    CLOSE deleted_cursor
+    DEALLOCATE deleted_cursor
+END
+GO
+
+IF (NOT OBJECT_ID('[dbo].[sp_syscollector_create_tsql_query_collector]', 'P') IS NULL)
+BEGIN
+    PRINT 'Dropping procedure [dbo].[sp_syscollector_create_tsql_query_collector]...'
+    DROP PROCEDURE [dbo].[sp_syscollector_create_tsql_query_collector]
+END
+GO
+
+PRINT 'Creating procedure [dbo].[sp_syscollector_create_tsql_query_collector]...'
+GO
+CREATE PROCEDURE [dbo].[sp_syscollector_create_tsql_query_collector]
+    @collection_set_uid            uniqueidentifier,
+    @collection_item_id            int,
+    @collection_package_id        uniqueidentifier,
+    @upload_package_id            uniqueidentifier
+AS
+BEGIN
+    -- Security check (role membership)
+    IF (NOT (ISNULL(IS_MEMBER(N'dc_operator'), 0) = 1) AND 
+        NOT (ISNULL(IS_MEMBER(N'dc_proxy'), 0) = 1) AND 
+        NOT (ISNULL(IS_MEMBER(N'db_owner'), 0) = 1))
+    BEGIN
+        RAISERROR(14677, -1, -1, 'dc_operator'' or ''dc_proxy')
+        RETURN(1) -- Failure
+    END
+
+    DECLARE @errMsg VARCHAR(256)
+    DECLARE @collection_set_id int
+    SELECT @collection_set_id = s.collection_set_id
+    FROM dbo.syscollector_collection_items i, dbo.syscollector_collection_sets s
+    WHERE i.collection_item_id = @collection_item_id
+    AND i.collector_type_uid = '302E93D1-3424-4be7-AA8E-84813ECF2419'
+    AND s.collection_set_uid = @collection_set_uid
+
+    -- Verify that the collection item exists of the correct type
+    IF (@collection_set_id IS NULL)
+    BEGIN        
+        SELECT @errMsg = CONVERT(VARCHAR(36), @collection_set_uid) + ', ' + CONVERT(VARCHAR(36), @collection_item_id)
+        RAISERROR(14262, -1, -1, '@collection_set_uid, @collection_item_id', @errMsg)
+        RETURN(1)
+    END
+
+    -- Get the names and folder ids for the generated packages
+    DECLARE @upload_package_name sysname
+    DECLARE @upload_package_folder_id uniqueidentifier
+    SELECT @upload_package_name = name, @upload_package_folder_id = folderid
+    FROM sysssispackages
+    WHERE id = @upload_package_id
+    
+    IF (@upload_package_name IS NULL) 
+    BEGIN
+        SELECT @errMsg = @upload_package_name + ', ' + CONVERT(VARCHAR(36), @upload_package_folder_id)
+        RAISERROR(14262, -1, -1, '@upload_package_name, @upload_package_folder_id', @errMsg)
+        RETURN(1)
+    END
+
+    DECLARE @collection_package_name sysname
+    DECLARE @collection_package_folder_id uniqueidentifier
+    SELECT @collection_package_name = name, @collection_package_folder_id = folderid
+    FROM sysssispackages
+    WHERE id = @collection_package_id
+    
+    IF (@collection_package_name IS NULL) 
+    BEGIN
+        SELECT @errMsg = @collection_package_name + ', ' + CONVERT(VARCHAR(36), @collection_package_folder_id)
+        RAISERROR(14262, -1, -1, '@collection_package_name, @collection_package_folder_id', @errMsg)
+        RETURN(1)
+    END
+
+    -- we need to allow dc_admin to delete these packages along with the collection set when 
+    -- the set is deleted
+    EXEC sp_ssis_setpackageroles @name = @upload_package_name, @folderid = @upload_package_folder_id, @readrole = NULL, @writerole = N'dc_admin'
+    EXEC sp_ssis_setpackageroles @name = @collection_package_name, @folderid = @collection_package_folder_id, @readrole = NULL, @writerole = N'dc_admin'
+
+    INSERT INTO [dbo].[syscollector_tsql_query_collector]
+    (
+        collection_set_uid,
+        collection_set_id, 
+        collection_item_id,
+        collection_package_id,
+        upload_package_id
+    )
+    VALUES
+    (
+        @collection_set_uid,
+        @collection_set_id,
+        @collection_item_id,
+        @collection_package_id,
+        @upload_package_id
+    )
+END
+GO
+
+IF (NOT OBJECT_ID('[dbo].[sp_syscollector_get_tsql_query_collector_package_ids]', 'P') IS NULL)
+BEGIN
+    PRINT 'Dropping procedure [dbo].[sp_syscollector_get_tsql_query_collector_package_ids]...'
+    DROP PROCEDURE [dbo].[sp_syscollector_get_tsql_query_collector_package_ids]
+END
+GO
+
+-- get and return the collection and upload package IDs
+-- if they do not exist, return empty IDs
+PRINT 'Creating procedure [dbo].[sp_syscollector_get_tsql_query_collector_package_ids]...'
+GO
+CREATE PROCEDURE [dbo].[sp_syscollector_get_tsql_query_collector_package_ids]
+    @collection_set_uid            uniqueidentifier,
+    @collection_item_id            int,
+    @collection_package_id        uniqueidentifier OUTPUT,
+    @upload_package_id            uniqueidentifier OUTPUT,
+    @collection_package_name    sysname OUTPUT,
+    @upload_package_name        sysname OUTPUT    
+AS
+BEGIN
+    -- Security check (role membership)
+    IF (NOT (ISNULL(IS_MEMBER(N'dc_operator'), 0) = 1) AND 
+        NOT (ISNULL(IS_MEMBER(N'dc_proxy'), 0) = 1) AND
+        NOT (ISNULL(IS_MEMBER(N'db_owner'), 0) = 1))
+    BEGIN
+        RAISERROR(14677, -1, -1, 'dc_operator'' or ''dc_proxy')
+        RETURN(1) -- Failure
+    END
+
+    SELECT @collection_package_id = collection_package_id,
+        @upload_package_id = upload_package_id
+    FROM dbo.syscollector_tsql_query_collector
+    WHERE @collection_item_id = collection_item_id 
+      AND @collection_set_uid = collection_set_uid
+
+    IF(@collection_package_id IS NOT NULL AND @upload_package_id IS NOT NULL)
+    BEGIN
+        SELECT @collection_package_name = name
+        FROM dbo.sysssispackages
+        WHERE @collection_package_id = id
+
+        SELECT @upload_package_name = name
+        FROM dbo.sysssispackages
+        WHERE @upload_package_id = id
+    END
+END
+GO
+
+--
+-- This stored procedure is used to cleanup all activities done while configuring Data collector
+-- In case a collection_set_id is passed to this stored procedure, only that collection set will be cleaned up
+-- otherwise, data collector will be restored to its original state
+-- Following cleanup  tasks are done
+-- a) Delete collect, upload jobs 
+-- b) Set Data collector to non-configured state 
+--    only if collection_set_id is not mentioned or the passed collection set is the last running
+--    collection set
+-- c) Delete all collection set logs
+--
+IF (NOT OBJECT_ID(N'[dbo].[sp_syscollector_cleanup_collector]', 'P') IS NULL)
+BEGIN
+    RAISERROR('Dropping procedure [dbo].[sp_syscollector_cleanup_collector] ...', 0, 1)  WITH NOWAIT;
+    DROP PROCEDURE [dbo].[sp_syscollector_cleanup_collector]
+END
+GO 
+
+RAISERROR('Creating procedure [dbo].[sp_syscollector_cleanup_collector] ...', 0, 1)  WITH NOWAIT;
+GO
+CREATE PROC [dbo].[sp_syscollector_cleanup_collector]
+    @collection_set_id INT = NULL
+AS
+BEGIN
+    IF (@collection_set_id IS NOT NULL)
+    BEGIN
+        DECLARE @retVal int
+        EXEC @retVal = dbo.sp_syscollector_verify_collection_set @collection_set_id OUTPUT
+        IF (@retVal <> 0)
+        BEGIN
+            RETURN (1)
+        END
+    END
+
+    DECLARE @TranCounter INT
+    SET @TranCounter = @@TRANCOUNT
+    IF (@TranCounter > 0)
+        SAVE TRANSACTION tran_cleanup_collection_set
+    ELSE
+        BEGIN TRANSACTION
+
+    BEGIN TRY
+    -- changing isolation level to repeatable to avoid any conflicts that may happen
+    -- while running this stored procedure and sp_syscollector_start_collection_set concurrently
+    SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
+
+    -- Security check (role membership)
+    IF (NOT (ISNULL(IS_MEMBER(N'dc_admin'), 0) = 1) AND NOT (ISNULL(IS_MEMBER(N'db_owner'), 0) = 1))
+    BEGIN
+        REVERT
+        RAISERROR(14677, -1, -1, 'dc_admin')
+        RETURN (1)
+    END
+
+    -- Disable constraints
+    -- this is done to make sure that constraint logic does not interfere with cleanup process
+    ALTER TABLE dbo.syscollector_collection_sets_internal NOCHECK CONSTRAINT FK_syscollector_collection_sets_collection_sysjobs
+    ALTER TABLE dbo.syscollector_collection_sets_internal NOCHECK CONSTRAINT FK_syscollector_collection_sets_upload_sysjobs
+
+    -- Delete data collector jobs
+    DECLARE @job_id uniqueidentifier
+    DECLARE datacollector_jobs_cursor CURSOR LOCAL 
+    FOR
+        SELECT collection_job_id AS job_id FROM syscollector_collection_sets
+        WHERE collection_job_id IS NOT NULL
+        AND ( collection_set_id = @collection_set_id OR @collection_set_id IS NULL)
+        UNION
+        SELECT upload_job_id AS job_id FROM syscollector_collection_sets
+        WHERE upload_job_id IS NOT NULL
+        AND ( collection_set_id = @collection_set_id OR @collection_set_id IS NULL)
+
+    OPEN datacollector_jobs_cursor
+    FETCH NEXT FROM datacollector_jobs_cursor INTO @job_id
+  
+    WHILE (@@fetch_status = 0)
+    BEGIN
+        IF EXISTS ( SELECT COUNT(job_id) FROM sysjobs WHERE job_id = @job_id )
+        BEGIN
+            DECLARE @job_name sysname
+            SELECT @job_name = name from sysjobs WHERE job_id = @job_id
+            PRINT 'Removing job '+ @job_name
+            EXEC dbo.sp_delete_job @job_id=@job_id, @delete_unused_schedule=0
+        END
+        FETCH NEXT FROM datacollector_jobs_cursor INTO @job_id
+    END
+    
+    CLOSE datacollector_jobs_cursor
+    DEALLOCATE datacollector_jobs_cursor
+
+    -- Enable Constraints back
+    ALTER TABLE dbo.syscollector_collection_sets_internal CHECK CONSTRAINT FK_syscollector_collection_sets_collection_sysjobs
+    ALTER TABLE dbo.syscollector_collection_sets_internal CHECK CONSTRAINT FK_syscollector_collection_sets_upload_sysjobs
+
+
+    -- Disable trigger on syscollector_collection_sets_internal
+    -- this is done to make sure that trigger logic does not interfere with cleanup process
+    EXEC('DISABLE TRIGGER syscollector_collection_set_is_running_update_trigger ON syscollector_collection_sets_internal')
+
+    -- Set collection sets as not running state and update collect and upload jobs as null
+    UPDATE syscollector_collection_sets_internal
+    SET is_running = 0, 
+        collection_job_id = NULL, 
+        upload_job_id = NULL
+    WHERE (collection_set_id = @collection_set_id OR @collection_set_id IS NULL)
+
+    -- Enable back trigger on syscollector_collection_sets_internal
+    EXEC('ENABLE TRIGGER syscollector_collection_set_is_running_update_trigger ON syscollector_collection_sets_internal')
+
+    -- re-set collector config store if there is no enabled collector
+    DECLARE @counter INT
+    SELECT @counter= COUNT(is_running) 
+    FROM syscollector_collection_sets_internal 
+    WHERE is_running = 1
+
+    IF (@counter = 0)  
+    BEGIN
+        UPDATE syscollector_config_store_internal
+        SET parameter_value = 0
+        WHERE parameter_name IN ('CollectorEnabled');
+
+        UPDATE syscollector_config_store_internal
+        SET parameter_value = NULL
+        WHERE parameter_name IN ( 'MDWDatabase', 'MDWInstance' )
+    END
+
+    -- Delete collection set logs
+    DELETE FROM syscollector_execution_log_internal
+    WHERE (collection_set_id = @collection_set_id OR @collection_set_id IS NULL)
+
+    IF (@TranCounter = 0)
+    BEGIN
+        COMMIT TRANSACTION
+    END
+    RETURN(0)
+    END TRY
+    BEGIN CATCH
+        IF (@TranCounter = 0 OR XACT_STATE() = -1)
+            ROLLBACK TRANSACTION
+        ELSE IF (XACT_STATE() = 1)
+            ROLLBACK TRANSACTION tran_cleanup_collection_set
+
+        DECLARE @ErrorMessage   NVARCHAR(4000);
+        DECLARE @ErrorSeverity  INT;
+        DECLARE @ErrorState     INT;
+        DECLARE @ErrorNumber    INT;
+        DECLARE @ErrorLine      INT;
+        DECLARE @ErrorProcedure NVARCHAR(200);
+        SELECT @ErrorLine = ERROR_LINE(),
+               @ErrorSeverity = ERROR_SEVERITY(),
+               @ErrorState = ERROR_STATE(),
+               @ErrorNumber = ERROR_NUMBER(),
+               @ErrorMessage = ERROR_MESSAGE(),
+               @ErrorProcedure = ISNULL(ERROR_PROCEDURE(), '-');
+        RAISERROR (14684, @ErrorSeverity, -1 , @ErrorNumber, @ErrorSeverity, @ErrorState, @ErrorProcedure, @ErrorLine, @ErrorMessage);
+        RETURN (1)
+    END CATCH
+END
+GO
+
+-- SQLTrace collector type
+DECLARE @collector_type_uid uniqueidentifier
+DECLARE @name sysname
+DECLARE @parameter_schema xml
+DECLARE @parameter_formatter xml
+DECLARE @collection_package_id uniqueidentifier
+DECLARE @upload_package_id uniqueidentifier
+
+SET @collector_type_uid = '0E218CF8-ECB5-417B-B533-D851C0251271'
+SET @name = 'Generic SQL Trace Collector Type'
+SET @parameter_schema = '<?xml version="1.0" encoding="utf-8"?>
+                        <xs:schema targetNamespace="DataCollectorType" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                         <xs:element name="SqlTraceCollector">
+                          <xs:complexType>
+                           <xs:sequence>
+                            <xs:element name="Events">
+                             <xs:complexType>
+                              <xs:sequence>
+                               <xs:element minOccurs="0" maxOccurs="unbounded" name="EventType">
+                                <xs:complexType>
+                                 <xs:sequence>
+                                  <xs:element maxOccurs="unbounded" name="Event">
+                                   <xs:complexType>
+                                    <xs:attribute name="id" type="xs:unsignedByte" use="required" />
+                                    <xs:attribute name="name" type="xs:string" use="required" />
+                                    <xs:attribute name="columnslist" type="xs:string" use="optional" />
+                                   </xs:complexType>
+                                  </xs:element>
+                                 </xs:sequence>
+                                 <xs:attribute name="id" type="xs:unsignedByte" use="optional" />
+                                 <xs:attribute name="name" type="xs:string" use="required" />
+                                </xs:complexType>
+                               </xs:element>
+                              </xs:sequence>
+                             </xs:complexType>
+                            </xs:element>
+                            <xs:element name="Filters">
+                             <xs:complexType>
+                              <xs:sequence>
+                               <xs:element name="Filter" minOccurs="0" maxOccurs="unbounded">
+                                <xs:complexType>
+                                 <xs:attribute name="columnid" type="xs:unsignedByte" use="required" />
+                                 <xs:attribute name="columnname" type="xs:string" use="required" />
+                                 <xs:attribute name="logical_operator" type="xs:string" use="required" />
+                                 <xs:attribute name="comparison_operator" type="xs:string" use="required" />
+                                 <xs:attribute name="value" type="xs:string" use="required" />
+                                </xs:complexType>
+                               </xs:element>
+                              </xs:sequence>
+                             </xs:complexType>
+                            </xs:element>
+                           </xs:sequence>
+                           <xs:attribute name="use_default" type="xs:boolean" />
+                          </xs:complexType>
+                         </xs:element>
+                        </xs:schema>'
+SET @parameter_formatter = 
+        N'<xsl:stylesheet 
+            xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+            version="1.0"
+            xmlns:z="#RowsetSchema"
+            >
+        <xsl:template match="/SqlTraceCollector">
+            <HTML>
+            <HEAD>
+            <TITLE></TITLE>
+            </HEAD>
+            <BODY>
+            <xsl:apply-templates select="Events"/>
+            <HR/
